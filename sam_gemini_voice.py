@@ -9,9 +9,11 @@ VISUAL MODES:
 3. Motion Dampening - Reduce motion salience for predictability
 
 USAGE:
-- Hold SPACE + speak naturally: "The screens are too bright" / "Blur the people"
+- Say "hey vibe" to start recording, then speak your command
+- End with "thanks" to process the command
+- Example: "hey vibe" → "blur my face" → "thanks"
 - Gemini Vision analyzes your environment and identifies the objects
-- Effects are applied in real-time to YOLO-detected objects
+- Effects are applied in real-time to detected objects
 
 Requirements:
   pip install google-generativeai speechrecognition pyaudio
@@ -1055,83 +1057,185 @@ Return JSON array: [{{"target_label": "label", "color": "color", "confidence": 0
 
 
 class VoiceListener:
-    """Push-to-talk voice listener - hold SPACE to speak."""
+    """Wake word voice listener - say "hey vibe" to start, "thanks" to stop."""
     
     def __init__(self):
         self.recognizer = sr.Recognizer()
         self.recognizer.energy_threshold = 300
         self.recognizer.dynamic_energy_threshold = True
-        self.recognizer.pause_threshold = 0.5
+        self.recognizer.pause_threshold = 0.8  # Longer pause for natural speech
         
         self.microphone = sr.Microphone()
         self.command_queue = queue.Queue()
         self.listening = True
-        self.is_recording = False  # Currently recording
+        self.is_recording = False  # Currently recording command
         self.is_processing = False  # Processing speech
         self.last_command = ""
-        self.status = "⏸️ Press SPACE to speak"
+        self.status = "👂 Listening for 'hey vibe'..."
         self._lock = threading.Lock()
+        
+        # Wake words
+        self.wake_phrases = ["hey vibe", "hey v", "hey by", "hey bye"]
+        self.stop_phrases = ["thanks", "thank you", "done", "stop"]
         
         # Calibrate
         with self.microphone as source:
             print("🎤 Calibrating microphone...")
             self.recognizer.adjust_for_ambient_noise(source, duration=1)
         
-        print("✅ Voice listener ready (press SPACE to speak)")
+        print("✅ Voice listener ready - say 'hey vibe' to start, 'thanks' to stop")
+        
+        # Start continuous listening thread
+        self._listening_thread = threading.Thread(target=self._continuous_listen, daemon=True)
+        self._listening_thread.start()
+    
+    def _continuous_listen(self):
+        """Continuously listen for wake word 'hey vibe'."""
+        while self.listening:
+            # Skip if already recording or processing
+            if self.is_recording or self.is_processing:
+                time.sleep(0.5)
+                continue
+                
+            try:
+                with self.microphone as source:
+                    # Listen for wake word (short timeout)
+                    audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=2)
+                
+                try:
+                    text = self.recognizer.recognize_google(audio).lower()
+                    
+                    # Check for wake word
+                    if any(phrase in text for phrase in self.wake_phrases):
+                        # Double-check we're not already recording
+                        with self._lock:
+                            if not self.is_recording and not self.is_processing:
+                                self.is_recording = True
+                            else:
+                                continue  # Already recording, skip
+                        
+                        self.status = "🔴 RECORDING... say your command, then 'thanks'"
+                        print("🎤 Wake word detected! Listening for command...")
+                        
+                        # Small delay to ensure microphone is released
+                        time.sleep(0.3)
+                        
+                        # Start recording command (will use its own microphone instance)
+                        threading.Thread(target=self._record_command, daemon=True).start()
+                    
+                except sr.UnknownValueError:
+                    pass  # Not a wake word, continue listening
+                except sr.RequestError as e:
+                    if self.listening:
+                        time.sleep(0.5)  # Brief pause on error
+                    
+            except sr.WaitTimeoutError:
+                continue  # No speech detected, keep listening
+            except Exception as e:
+                if self.listening:
+                    print(f"⚠️ Listening error: {e}")
+                    time.sleep(0.5)
+    
+    def _record_command(self):
+        """Record command until 'thanks' is heard."""
+        command_parts = []
+        max_phrases = 10  # Limit to prevent infinite recording
+        phrase_count = 0
+        
+        # Create a separate recognizer instance for command recording
+        cmd_recognizer = sr.Recognizer()
+        cmd_recognizer.energy_threshold = 300
+        cmd_recognizer.pause_threshold = 0.8
+        
+        while self.is_recording and phrase_count < max_phrases:
+            try:
+                # Use a new microphone context to avoid conflicts
+                with self.microphone as source:
+                    # Adjust for ambient noise quickly
+                    cmd_recognizer.adjust_for_ambient_noise(source, duration=0.2)
+                    # Listen for command phrase (longer timeout)
+                    audio = cmd_recognizer.listen(source, timeout=5, phrase_time_limit=8)
+                
+                try:
+                    text = cmd_recognizer.recognize_google(audio).lower()
+                    
+                    # Check for stop word
+                    if any(phrase in text for phrase in self.stop_phrases):
+                        # Remove stop word from last phrase
+                        for phrase in self.stop_phrases:
+                            text = text.replace(phrase, "").strip()
+                        if text:
+                            command_parts.append(text)
+                        
+                        # Stop recording
+                        with self._lock:
+                            self.is_recording = False
+                        self.status = "🔄 Processing..."
+                        break
+                    else:
+                        # Add to command
+                        command_parts.append(text)
+                        phrase_count += 1
+                        self.status = f"🔴 Recording... ({phrase_count}/{max_phrases}) say 'thanks' when done"
+                
+                except sr.UnknownValueError:
+                    # No speech detected, continue listening
+                    continue
+                except sr.RequestError as e:
+                    print(f"⚠️ Speech API error: {e}")
+                    with self._lock:
+                        self.is_recording = False
+                    break
+                    
+            except sr.WaitTimeoutError:
+                # Timeout - assume command is done if we have something
+                if command_parts:
+                    with self._lock:
+                        self.is_recording = False
+                    break
+                continue
+            except OSError as e:
+                # Microphone busy or unavailable
+                print(f"⚠️ Microphone error: {e}")
+                with self._lock:
+                    self.is_recording = False
+                break
+            except Exception as e:
+                print(f"⚠️ Recording error: {e}")
+                import traceback
+                traceback.print_exc()
+                with self._lock:
+                    self.is_recording = False
+                break
+        
+        # Process collected command
+        if command_parts:
+            full_command = " ".join(command_parts).strip()
+            if full_command and len(full_command) > 2:
+                with self._lock:
+                    self.is_processing = True
+                
+                self.last_command = full_command
+                self.command_queue.put(full_command)
+                self.status = f"✅ Got: {full_command[:40]}..."
+                print(f"🗣️ Command: {full_command}")
+            else:
+                self.status = "👂 Listening for 'hey vibe'..."
+        else:
+            self.status = "👂 Listening for 'hey vibe'..."
+        
+        # Reset state
+        with self._lock:
+            self.is_recording = False
+            self.is_processing = False
     
     def start_recording(self):
-        """Start recording when SPACE pressed."""
-        with self._lock:
-            if self.is_recording or self.is_processing:
-                return  # Already busy
-            self.is_recording = True
-            self.status = "🔴 RECORDING... speak now!"
-        
-            threading.Thread(target=self._record_once, daemon=True).start()
+        """Legacy method - no longer used (wake word handles this)."""
+        pass
     
     def stop_recording(self):
-        """Stop recording when SPACE released."""
-        pass  # Recording stops naturally when speech ends
-    
-    def _record_once(self):
-        """Record a single utterance."""
-        try:
-            with self.microphone as source:
-                # Listen for speech
-                audio = self.recognizer.listen(source, timeout=3, phrase_time_limit=6)
-            
-            with self._lock:
-                self.is_recording = False
-                self.is_processing = True
-            self.status = "🔄 Processing..."
-            
-            try:
-                text = self.recognizer.recognize_google(audio)
-                if text and len(text) > 2:
-                    self.last_command = text
-                    self.command_queue.put(text)
-                    self.status = f"✅ Got: {text[:30]}..."
-                    print(f"🗣️ Heard: {text}")
-                else:
-                    self.status = "⏸️ Press SPACE to speak"
-            except sr.UnknownValueError:
-                self.status = "❓ Didn't catch that - try again"
-                print("❓ Didn't understand speech")
-            except sr.RequestError as e:
-                self.status = "❌ Speech API error"
-                print(f"Speech API error: {e}")
-                
-        except sr.WaitTimeoutError:
-            self.status = "⏸️ Press SPACE to speak"
-            print("⏱️ Recording timed out")
-        except Exception as e:
-            print(f"Recording error: {e}")
-            self.status = "⏸️ Press SPACE to speak"
-        finally:
-            # ALWAYS reset state so next recording can happen
-            with self._lock:
-                self.is_recording = False
-                self.is_processing = False
+        """Legacy method - no longer used (wake word handles this)."""
+        pass
     
     def is_busy(self):
         """Check if currently recording or processing."""
@@ -1339,7 +1443,7 @@ class EnvironmentController:
         }
         
         print("\n✅ Ready!")
-        print("   🎤 Hold SPACE + speak: 'Make the wall blue' / 'Dim the ceiling'")
+        print("   🎤 Say 'hey vibe' then your command, end with 'thanks'")
         print("   ⌨️  Q=quit  C=clear  S=screenshot  P=toggle autopilot\n")
 
     def _sanitize_class_name(self, name: str) -> str:
@@ -3078,7 +3182,7 @@ def main():
                 # Help text at bottom
                 help_y = h - 25
                 cv2.rectangle(display, (0, help_y - 5), (w, h), (30, 30, 30), -1)
-                cv2.putText(display, "SPACE=record | V=clean view | C=clear | L=labels | S=save | Q=quit", 
+                cv2.putText(display, "Say 'hey vibe' to start | V=clean view | C=clear | L=labels | S=save | Q=quit", 
                            (10, help_y + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
             else:
                 # Clean view: minimal UI
@@ -3112,8 +3216,8 @@ def main():
                     status = f" -> {effect}" if effect else ""
                     print(f"  {i+1}. {label}{status}")
                 print(f"{'='*50}\n")
-            elif key == ord(' '):  # SPACE - start recording
-                controller.voice.start_recording()
+            # Voice recording now handled by wake words ("hey vibe" / "thanks")
+            # No keyboard input needed
 
             # Auto-stop when the online training loop reaches target confidence
             if controller.gemini.should_stop():
