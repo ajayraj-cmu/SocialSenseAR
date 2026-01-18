@@ -28,12 +28,37 @@ from effects import get_effect
 from ui.overlay_panels import render_overlay
 
 
+def find_ffmpeg() -> str:
+    """Find ffmpeg executable."""
+    import shutil
+    ffmpeg = shutil.which('ffmpeg')
+    if ffmpeg:
+        return ffmpeg
+
+    # Common Windows locations
+    common_paths = [
+        r"C:\Program Files\ShareX\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\tools\ffmpeg\bin\ffmpeg.exe",
+    ]
+    for path in common_paths:
+        if Path(path).exists():
+            return path
+    return None
+
+
 def extract_audio(video_path: Path, audio_path: Path) -> bool:
     """Extract audio from video using ffmpeg."""
     import subprocess
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        print("[AUDIO] ffmpeg not found")
+        return False
+
     try:
         cmd = [
-            'ffmpeg', '-y', '-i', str(video_path),
+            ffmpeg, '-y', '-i', str(video_path),
             '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
             str(audio_path)
         ]
@@ -41,6 +66,66 @@ def extract_audio(video_path: Path, audio_path: Path) -> bool:
         return True
     except Exception as e:
         print(f"[AUDIO] Could not extract audio: {e}")
+        return False
+
+
+def mux_audio(video_path: Path, audio_source: Path, output_path: Path, fps: float = 30.0) -> bool:
+    """Re-encode video with H.264 and mux audio from source using ffmpeg.
+
+    This fixes jittering by using proper H.264 encoding with constant frame rate.
+    """
+    import subprocess
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        print("[AUDIO] ffmpeg not found, output will have no audio")
+        return False
+
+    print(f"[FFMPEG] Re-encoding with H.264 and adding audio...")
+    temp_output = output_path.with_suffix('.temp.mp4')
+
+    try:
+        # Rename current output to temp
+        if temp_output.exists():
+            temp_output.unlink()
+        video_path_to_mux = output_path
+        video_path_to_mux.rename(temp_output)
+
+        cmd = [
+            ffmpeg, '-y',
+            '-i', str(temp_output),       # Rendered video (no audio)
+            '-i', str(audio_source),      # Original video (for audio)
+            '-c:v', 'libx264',            # Re-encode with H.264
+            '-preset', 'fast',            # Encoding speed/quality tradeoff
+            '-crf', '18',                 # Quality (lower = better, 18 is visually lossless)
+            '-r', str(fps),               # Force constant frame rate
+            '-pix_fmt', 'yuv420p',        # Compatibility
+            '-c:a', 'aac',                # Encode audio as AAC
+            '-b:a', '192k',               # Audio bitrate
+            '-map', '0:v:0',              # Take video from first input
+            '-map', '1:a:0',              # Take audio from second input
+            '-shortest',                   # End when shortest stream ends
+            '-movflags', '+faststart',    # Web-friendly
+            str(output_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"[FFMPEG] error: {result.stderr}")
+            # Restore original
+            temp_output.rename(output_path)
+            return False
+
+        # Cleanup temp file
+        if temp_output.exists():
+            temp_output.unlink()
+
+        print(f"[FFMPEG] Encoding complete!")
+        return True
+
+    except Exception as e:
+        print(f"[FFMPEG] Could not encode video: {e}")
+        # Try to restore original if it exists
+        if temp_output.exists() and not output_path.exists():
+            temp_output.rename(output_path)
         return False
 
 
@@ -151,7 +236,8 @@ def render_demo_video(
     process_audio: bool = False,
     show_preview: bool = False,
     script_file: str = None,
-    use_mock_state: bool = True
+    use_mock_state: bool = True,
+    effect_start: float = 0.0
 ):
     """Render a demo video with conversation helper overlay.
 
@@ -163,6 +249,7 @@ def render_demo_video(
         show_preview: Show preview window while rendering
         script_file: Optional JSON file with scripted state changes
         use_mock_state: Use mock state timeline for demo (default True)
+        effect_start: Time in seconds when focus effect starts (default 0.0)
     """
     input_path = Path(input_path)
     output_path = Path(output_path)
@@ -271,18 +358,24 @@ def render_demo_video(
             processor.process(frame_rgb)
             result = processor.get_result()
 
-            # Apply focus effect
-            if result is not None and result.has_detection:
+            # Apply focus effect (only after effect_start time)
+            effect_active = current_time >= effect_start
+
+            if effect_active and result is not None and result.has_detection:
                 frame_out = effect.apply(frame_rgb, result)
                 person_tracked = True
                 head_x = result.left_center[0]
                 head_y = max(0.1, result.left_center[1] - 0.15)
             else:
                 frame_out = effect.no_effect(frame_rgb)
-                person_tracked = False
-                head_x, head_y = 0.5, 0.3
+                person_tracked = result is not None and result.has_detection if effect_active else False
+                if person_tracked:
+                    head_x = result.left_center[0]
+                    head_y = max(0.1, result.left_center[1] - 0.15)
+                else:
+                    head_x, head_y = 0.5, 0.3
 
-            # Render overlay
+            # Render overlay (expects BGR, returns BGR)
             frame_out = render_overlay(
                 frame_out,
                 head_x=head_x,
@@ -290,15 +383,13 @@ def render_demo_video(
                 person_tracked=person_tracked
             )
 
-            # Convert back to BGR for output
-            frame_out_bgr = cv2.cvtColor(frame_out, cv2.COLOR_RGB2BGR)
-
-            # Write frame
-            out.write(frame_out_bgr)
+            # frame_out is already BGR (effect.apply returns BGR, overlay expects/returns BGR)
+            # Write frame directly
+            out.write(frame_out)
 
             # Show preview if requested
             if show_preview:
-                preview = cv2.resize(frame_out_bgr, (width // 2, height // 2))
+                preview = cv2.resize(frame_out, (width // 2, height // 2))
                 cv2.imshow('Preview', preview)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     print("\nPreview closed, stopping render...")
@@ -317,9 +408,13 @@ def render_demo_video(
 
     print(f"\n{'='*60}")
     print(f"Rendering complete!")
-    print(f"Output saved to: {output_path}")
     print(f"Frames rendered: {frame_idx}")
     print(f"{'='*60}\n")
+
+    # Re-encode with H.264 and mux audio from original video
+    mux_audio(output_path, input_path, output_path, fps=input_fps)
+
+    print(f"Output saved to: {output_path}")
 
     return True
 
@@ -355,6 +450,8 @@ Script JSON format:
                         help='JSON file with scripted state changes')
     parser.add_argument('--no-mock', action='store_true',
                         help='Disable mock state (overlay shows static content)')
+    parser.add_argument('--effect-start', type=float, default=0.0,
+                        help='Time in seconds when focus effect starts (default: 0.0)')
 
     args = parser.parse_args()
 
@@ -365,7 +462,8 @@ Script JSON format:
         process_audio=args.audio,
         show_preview=args.preview,
         script_file=args.script,
-        use_mock_state=not args.no_mock
+        use_mock_state=not args.no_mock,
+        effect_start=args.effect_start
     )
 
     sys.exit(0 if success else 1)

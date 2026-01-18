@@ -16,6 +16,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,13 +28,42 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def find_ffmpeg() -> str:
+    """Find ffmpeg executable, checking common installation locations."""
+    # Check PATH first
+    ffmpeg = shutil.which('ffmpeg')
+    if ffmpeg:
+        return ffmpeg
+
+    # Common Windows locations
+    common_paths = [
+        r"C:\Program Files\ShareX\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\tools\ffmpeg\bin\ffmpeg.exe",
+    ]
+
+    for path in common_paths:
+        if Path(path).exists():
+            return path
+
+    return None
+
+
 def extract_audio(video_path: Path, audio_path: Path) -> bool:
     """Extract audio from video as 16kHz mono WAV for Whisper."""
     print(f"[AUDIO] Extracting audio from {video_path.name}...")
 
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        print("[AUDIO] Error: ffmpeg not found. Please install ffmpeg.")
+        return False
+
+    print(f"[AUDIO] Using ffmpeg: {ffmpeg}")
+
     try:
         cmd = [
-            'ffmpeg', '-y', '-i', str(video_path),
+            ffmpeg, '-y', '-i', str(video_path),
             '-vn',                    # No video
             '-acodec', 'pcm_s16le',   # PCM 16-bit
             '-ar', '16000',           # 16kHz for Whisper
@@ -72,14 +102,19 @@ def transcribe_audio(audio_path: Path) -> list:
             )
 
         segments = []
-        if hasattr(response, 'segments'):
+        if hasattr(response, 'segments') and response.segments:
             for seg in response.segments:
+                # Handle both dict and object formats
+                start = seg.start if hasattr(seg, 'start') else seg['start']
+                end = seg.end if hasattr(seg, 'end') else seg['end']
+                text = seg.text if hasattr(seg, 'text') else seg['text']
+                text = text.strip()
                 segments.append({
-                    'start': seg['start'],
-                    'end': seg['end'],
-                    'text': seg['text'].strip()
+                    'start': start,
+                    'end': end,
+                    'text': text
                 })
-                print(f"  [{seg['start']:.1f}s - {seg['end']:.1f}s] {seg['text'].strip()}")
+                print(f"  [{start:.1f}s - {end:.1f}s] {text}")
 
         print(f"[WHISPER] Transcribed {len(segments)} segments")
         return segments
