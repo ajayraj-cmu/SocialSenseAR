@@ -1,0 +1,56 @@
+# Perceptual Modulation Engine for Meta Quest 3 Passthrough
+# Core dependencies with pinned versions for reproducibility
+
+# ============================================================
+# CORE VISION & ML
+# ============================================================
+torch>=2.1.0
+torchvision>=0.16.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+
+# SAM-3 (Segment Anything Model 2/3)
+# Install from: https://github.com/facebookresearch/segment-anything-2
+# segment-anything-2>=1.0.0
+
+# Depth estimation
+timm>=0.9.0  # For MiDaS backbone
+
+# ============================================================
+# AUDIO PROCESSING
+# ============================================================
+sounddevice>=0.4.6
+scipy>=1.11.0
+librosa>=0.10.0
+pyaudio>=0.2.13
+
+# ============================================================
+# OBJECT TRACKING
+# ============================================================
+filterpy>=1.4.5  # Kalman filtering
+scikit-image>=0.21.0
+
+# ============================================================
+# NATURAL LANGUAGE PROCESSING
+# ============================================================
+spacy>=3.6.0
+# python -m spacy download en_core_web_sm
+
+# ============================================================
+# SYSTEM & UTILITIES
+# ============================================================
+pynput>=1.7.6  # Keyboard input handling
+pydantic>=2.0.0  # Data validation
+loguru>=0.7.0  # Structured logging
+rich>=13.0.0  # Terminal output
+PyYAML>=6.0
+
+# ============================================================
+# OPTIONAL: PERFORMANCE & DEBUGGING
+# ============================================================
+# tensorrt>=8.6.0  # NVIDIA TensorRT for inference optimization
+# onnxruntime-gpu>=1.15.0  # ONNX Runtime with GPU support
+line_profiler>=4.0.0
+memory_profiler>=0.61.0
+
+
