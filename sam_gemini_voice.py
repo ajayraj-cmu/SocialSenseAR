@@ -70,27 +70,63 @@ except ImportError:
     GEMINI_AVAILABLE = False
     print("⚠️  google-generativeai not installed. Run: pip install google-generativeai")
 
+# Overshoot Vision API (optional - enhanced labeling)
+try:
+    from overshoot_client import OvershootLabeler, is_overshoot_available
+    OVERSHOOT_AVAILABLE = is_overshoot_available()
+except ImportError:
+    OVERSHOOT_AVAILABLE = False
+    OvershootLabeler = None
+
 
 class GeminiAgent:
-    """Handles Gemini text and vision processing."""
+    """Handles Gemini text and vision processing + Overshoot integration."""
     
     def __init__(self):
         # Prioritize GEMINI_API_KEY, fallback to GOOGLE_API_KEY
         self.api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        
+        # ==========================================
+        # OVERSHOOT VISION API (optional backend)
+        # ==========================================
+        self.overshoot_labeler = None
+        self.use_overshoot = False
+        overshoot_key = os.environ.get("OVERSHOOT_API_KEY", "")
+        if overshoot_key and overshoot_key != "your-overshoot-api-key-here" and OVERSHOOT_AVAILABLE:
+            try:
+                print(f"  🔧 Initializing Overshoot (key length: {len(overshoot_key)})...")
+                self.overshoot_labeler = OvershootLabeler(api_key=overshoot_key, debug=True)
+                self.use_overshoot = self.overshoot_labeler.available
+                if self.use_overshoot:
+                    print("  ✓ Overshoot Vision API (enhanced labeling)")
+                else:
+                    print("  ⚠️ Overshoot initialized but not available")
+            except Exception as e:
+                print(f"  ⚠️ Overshoot init failed: {e}")
+                import traceback
+                traceback.print_exc()
+        elif overshoot_key and overshoot_key == "your-overshoot-api-key-here":
+            print("  ⚠️ OVERSHOOT_API_KEY is still placeholder - update .env with real key")
+        elif not OVERSHOOT_AVAILABLE:
+            print("  ⚠️ Overshoot dependencies not available (aiortc/aiohttp)")
         
         self.scene_objects = []
         self.last_scene_analysis = None
         self.scene_context = {}  # Continuous scene context
         
         # ==========================================
-        # GEMINI API RATE LIMITING
+        # GEMINI API RATE LIMITING (VERY CONSERVATIVE)
+        # Using Overshoot when available, Gemini as fallback only
         # ==========================================
         self.vision_call_count = 0
         self.last_vision_call = 0
-        self.min_vision_interval = 2.0  # Minimum 2 seconds between vision API calls
-        self.max_vision_calls_per_minute = 10  # Limit vision calls per minute
+        self.min_vision_interval = 5.0  # Minimum 5 seconds between Gemini vision calls
+        self.max_vision_calls_per_minute = 3  # Max 3 Gemini calls per minute
         self.vision_calls_this_minute = 0
         self.minute_start = time.time()
+        
+        # Track which API is being used
+        self.last_api_used = "none"
         
         # ==========================================
         # COMPREHENSIVE FEEDBACK LOOP SYSTEM
@@ -100,7 +136,7 @@ class GeminiAgent:
         self.confidence_adjustments = {}  # Store confidence adjustments (label -> multiplier)
         self.optimization_history = []  # Track optimizations over time
         self.last_feedback_update = 0
-        self.feedback_interval = 3.0  # Update feedback every 3 seconds (reduced from 0.5s)
+        self.feedback_interval = 10.0  # Update feedback every 10 seconds (minimizing API calls)
         
         # Detection quality metrics
         self.detection_accuracy = {}  # Track accuracy per object type
@@ -193,9 +229,39 @@ class GeminiAgent:
         self.last_vision_call = time.time()
     
     def label_all_segments(self, frame, masks_with_centers):
-        """Use Gemini Vision to label ALL SAM segments - OPEN VOCABULARY detection."""
+        """Use Overshoot or Gemini Vision to label ALL SAM segments - OPEN VOCABULARY detection."""
+        
+        # ==========================================
+        # TRY OVERSHOOT FIRST (if available) - PREFERRED
+        # ==========================================
+        if self.use_overshoot and self.overshoot_labeler:
+            try:
+                labels = self.overshoot_labeler.label_segments(frame, masks_with_centers)
+                if labels:
+                    self.last_api_used = "overshoot"
+                    print(f"  🎯 Overshoot: {', '.join(list(labels.values())[:8])}")
+                    return labels
+            except Exception as e:
+                print(f"  ⚠️ Overshoot error: {e}")
+        
+        # ==========================================
+        # USE SMART FALLBACK INSTEAD OF GEMINI (saves API calls)
+        # ==========================================
+        fallback_labels = self._smart_fallback_labels(masks_with_centers, frame)
+        if fallback_labels:
+            self.last_api_used = "fallback"
+            return fallback_labels
+        
+        # ==========================================
+        # GEMINI VISION - ONLY AS LAST RESORT (very rate limited)
+        # Smart fallback should handle most cases
+        # ==========================================
         if not self.available or not self._can_call_vision():
             return None
+        
+        # Only use Gemini if we have very few labels from fallback
+        print(f"  📡 Using Gemini Vision (rate limited: {self.vision_calls_this_minute}/{self.max_vision_calls_per_minute} this minute)")
+        self.last_api_used = "gemini"
         
         try:
             # Convert frame to PIL Image
@@ -1284,7 +1350,7 @@ class EnvironmentController:
         self.label_change_threshold = 0.5  # Need 50% better confidence to change a label
 
         # Autopilot (optional): injects test commands to stress-test mapping until stop condition
-        self.autopilot_enabled = os.environ.get("AUTO_AUTOPILOT", "1") == "1"
+        self.autopilot_enabled = os.environ.get("AUTO_AUTOPILOT", "0") == "1"  # Default OFF
         self._autopilot_last = 0.0
         self._autopilot_interval = float(os.environ.get("AUTO_AUTOPILOT_SEC", "6.0"))
         
@@ -1467,49 +1533,14 @@ class EnvironmentController:
         if self.frame_count % 10 == 0:  # Update every 10 frames
             self.current_frame = frame.copy()
         
-        # FEEDBACK LOOP: Continuous validation and self-correction
-        if self.gemini.available and current_time - self.last_feedback_validation > self.feedback_validation_interval:
-            mask_labels = [m[1] for m in self.masks]
-            mask_centers = [m[2] for m in self.masks]
-            
-            # Prepare detection data for validation
-            detected_objects = []
-            for mask, label, center in self.masks:
-                detected_objects.append({
-                    "label": label,
-                    "position": f"({center[0]}, {center[1]})" if center else "unknown",
-                    "confidence": 0.7  # Default confidence
-                })
-            
-            # Run feedback validation in background thread
-            threading.Thread(
-                target=self._run_feedback_loop,
-                args=(frame.copy(), detected_objects, self.yolo_detections.copy()),
-                daemon=True
-            ).start()
+        # ==========================================
+        # FEEDBACK LOOPS - DISABLED TO MINIMIZE GEMINI API USAGE
+        # Using smart fallback labels instead
+        # ==========================================
+        # Only run feedback every 30 seconds (very conservative)
+        if self.gemini.available and current_time - self.last_feedback_validation > 30.0:
             self.last_feedback_validation = current_time
-        
-        # Update scene analysis with Gemini Vision every 1 second (continuous analysis)
-        if self.gemini.available and current_time - self.last_scene_update > 1.0:
-            mask_labels = [m[1] for m in self.masks]
-            mask_centers = [m[2] for m in self.masks]
-            # Continuous scene analysis for better context
-            threading.Thread(target=self.gemini.analyze_scene_continuous, 
-                           args=(frame.copy(), mask_labels, mask_centers), daemon=True).start()
-            self.last_scene_update = current_time
-        
-        # ==========================================
-        # COMPREHENSIVE FEEDBACK LOOP (Self-Correction)
-        # ==========================================
-        if self.gemini.available:
-            mask_labels = [m[1] for m in self.masks]
-            mask_centers = [m[2] for m in self.masks]
-            # Run feedback loop in background thread (every 500ms)
-            threading.Thread(target=self.gemini.comprehensive_feedback_loop,
-                           args=(frame.copy(), mask_labels, self.yolo_detections, mask_centers),
-                           daemon=True).start()
-            
-            # Sync adaptive thresholds with feedback loop optimizations
+            # Sync thresholds without API call
             self._sync_thresholds()
         
         # Check for voice commands
@@ -1767,7 +1798,7 @@ class EnvironmentController:
                         # Fallback to simple dimming
                         mask_3d = np.stack([mask, mask, mask], axis=2)
                         display = (display * (1 - mask_3d * 0.5) + frame * mask_3d * 0.3).astype(np.uint8)
-                else:
+            else:
                     # ==========================================
                     # COLOR REMAPPING MODE
                     # ==========================================
@@ -2267,7 +2298,7 @@ class EnvironmentController:
                 return "item_wide", None  # Could be keyboard, book
             elif aspect < 0.7:
                 return "item_tall", None  # Could be bottle, cup
-            else:
+        else:
                 return "item", None  # Square-ish item
         
         # Very small objects
@@ -3072,7 +3103,7 @@ def main():
                     cv2.putText(display, "ACTIVE EFFECTS:", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
                     for label, color in list(controller.active_effects.items())[:6]:  # Show max 6
                         y += 14
-                        cv2.putText(display, f"  {label} -> {color}", (10, y), 
+                    cv2.putText(display, f"  {label} -> {color}", (10, y), 
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 255, 150), 1)
                 
                 # Help text at bottom
