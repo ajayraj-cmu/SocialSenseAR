@@ -1723,11 +1723,23 @@ class EnvironmentController:
         # Use tracked masks (includes interpolated positions for missing detections)
         tracked_masks_for_display = self._get_tracked_masks_for_display(h, w)
         
-        # Build all_labels_to_mask from tracked masks for effects
-        all_labels_to_mask = {label: mask for mask, label, center in tracked_masks_for_display}
+        # ==========================================
+        # FILTER: Only include masks that have active effects (requested assets)
+        # Only requested assets should have colored/blurred/shaded masks
+        # Everything else remains unmasked until requested
+        # ==========================================
+        # Build all_labels_to_mask ONLY from masks that have active effects
+        all_labels_to_mask = {}
+        for mask, label, center in tracked_masks_for_display:
+            # Only include masks that have been requested via voice commands
+            matched_effect = self._match_effect(label)
+            if matched_effect:
+                all_labels_to_mask[label] = mask
         
         # ==========================================
-        # DRAW BORDERS AND LABELS (unless clean_view_mode)
+        # DRAW BORDERS AND LABELS (for ALL detected objects)
+        # Show boundaries for all detected items so user can see what's available
+        # But visual effects (shading/blur/color) are only applied when requested
         # ==========================================
         bright_colors = [
             (0, 255, 255),   # Cyan
@@ -1742,17 +1754,29 @@ class EnvironmentController:
             (100, 255, 200), # Mint
         ]
         
-        # Only draw borders and labels if NOT in clean view mode
+        # Draw borders and labels for ALL masks (so user can see what's detected)
+        # But visual effects will only be applied to requested items
         if not self.clean_view_mode:
             for idx, (mask, label, center) in enumerate(tracked_masks_for_display):
                 if mask is None or mask.shape != (h, w):
                     continue
+                
                 mask_u8 = (mask * 255).astype(np.uint8)
                 contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 
-                # BRIGHT colored borders
-                border_color = bright_colors[idx % len(bright_colors)]
-                cv2.drawContours(display, contours, -1, border_color, 2)
+                # Check if this mask has an active effect
+                matched_effect = self._match_effect(label)
+                has_effect = matched_effect is not None
+                
+                # Use different border colors: brighter for items with effects, dimmer for others
+                if has_effect:
+                    border_color = bright_colors[idx % len(bright_colors)]
+                    border_width = 2
+                else:
+                    border_color = (100, 100, 100)  # Dim gray for unrequested items
+                    border_width = 1
+                
+                cv2.drawContours(display, contours, -1, border_color, border_width)
                 
                 # Draw label at center
                 if center and center[0] > 0 and label:
@@ -1762,23 +1786,32 @@ class EnvironmentController:
                     is_pending = label.startswith("~")
                     display_label = label[1:] if is_pending else label  # Remove ~ prefix for display
                     
-                    # Different styling for confirmed vs pending
+                    # Different styling for confirmed vs pending, and for items with/without effects
                     if is_pending:
                         # Pending labels: smaller, dimmer
                         (tw, th), _ = cv2.getTextSize(display_label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
                         cv2.rectangle(display, (cx-2, cy-th-2), (cx+tw+2, cy+2), (50, 50, 50), -1)
                         cv2.putText(display, display_label, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
                     else:
-                        # Confirmed labels: bright, clear
-                        (tw, th), _ = cv2.getTextSize(display_label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                        cv2.rectangle(display, (cx-3, cy-th-4), (cx+tw+3, cy+4), (0, 0, 0), -1)
-                        cv2.putText(display, display_label, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, border_color, 1)
+                        # Confirmed labels: bright for items with effects, dimmer for others
+                        if has_effect:
+                            (tw, th), _ = cv2.getTextSize(display_label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                            cv2.rectangle(display, (cx-3, cy-th-4), (cx+tw+3, cy+4), (0, 0, 0), -1)
+                            cv2.putText(display, display_label, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, border_color, 1)
+                        else:
+                            # Dimmer styling for unrequested items
+                            (tw, th), _ = cv2.getTextSize(display_label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+                            cv2.rectangle(display, (cx-2, cy-th-3), (cx+tw+2, cy+3), (30, 30, 30), -1)
+                            cv2.putText(display, display_label, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
         
-        # Apply effects to ALL FastSAM segments (labeled by Gemini)
+        # Apply effects ONLY to masks that have been explicitly requested via voice commands
+        # all_labels_to_mask already contains only masks with active effects (filtered above)
+        # Double-check to ensure no effects are applied unless explicitly requested
         for label, mask in all_labels_to_mask.items():
-            # Check if this label has an active effect
+            # STRICT CHECK: Only apply effects if this label has an active effect
             matched_effect = self._match_effect(label)
-            if matched_effect:
+            if not matched_effect:
+                continue  # Skip - no effect requested for this mask
                 # Check if it's a modulation or color
                 if isinstance(matched_effect, str) and matched_effect.startswith("mod_"):
                     # Parse modulation parameters
@@ -1844,7 +1877,7 @@ class EnvironmentController:
                             if not hasattr(self, 'prev_regions'):
                                 self.prev_regions = {}
                             
-                            region_key = f"motion_{yolo_label}"
+                            region_key = f"motion_{label}"
                             smooth_factor = mod_params.get('temporal_smooth', 0.7)
                             
                             current_region = display[mask_bool].copy()
@@ -1868,9 +1901,9 @@ class EnvironmentController:
                         
                     except Exception as e:
                         print(f"  ⚠️ Modulation error: {e}")
-                        # Fallback to simple dimming
-                        mask_3d = np.stack([mask, mask, mask], axis=2)
-                        display = (display * (1 - mask_3d * 0.5) + frame * mask_3d * 0.3).astype(np.uint8)
+                        # NO FALLBACK - don't apply any effects if there's an error
+                        # This ensures only explicitly requested effects are applied
+                        pass
                 else:
                     # ==========================================
                     # COLOR REMAPPING MODE
