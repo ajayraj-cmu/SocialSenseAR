@@ -64,6 +64,28 @@ import mediapipe as mp
 # Speech recognition
 import speech_recognition as sr
 
+# Audio processing (optional)
+try:
+    import sounddevice as sd
+    AUDIO_AVAILABLE = True
+except ImportError:
+    AUDIO_AVAILABLE = False
+    print("⚠️  sounddevice not installed. Audio features disabled. Run: pip install sounddevice")
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    print("⚠️  torch not installed. Audio processing disabled. Run: pip install torch")
+
+try:
+    from df.enhance import enhance, init_df
+    DEEPFILTER_AVAILABLE = True
+except ImportError:
+    DEEPFILTER_AVAILABLE = False
+    print("⚠️  DeepFilterNet not installed. Audio isolation disabled. Run: pip install deepfilternet")
+
 # Gemini
 try:
     import google.generativeai as genai
@@ -1056,8 +1078,177 @@ Return JSON array: [{{"target_label": "label", "color": "color", "confidence": 0
         return results
 
 
+class AudioProcessor:
+    """Real-time audio processing with DeepFilterNet for voice isolation."""
+    
+    def __init__(self):
+        self.available = AUDIO_AVAILABLE
+        self.use_deepfilter = AUDIO_AVAILABLE and TORCH_AVAILABLE and DEEPFILTER_AVAILABLE
+        self.is_active = False
+        self.voice_isolation_enabled = False
+        self.audio_stream = None
+        self.model = None
+        self.df_state = None
+        self.fs = 48000 if self.use_deepfilter else 44100  # Use 48kHz for DeepFilterNet, 44.1kHz otherwise
+        self.blocksize = int(self.fs * 0.1)  # 100ms blocks
+        
+        # Queues for async processing (only if using DeepFilterNet)
+        if self.use_deepfilter:
+            self.input_queue = queue.Queue(maxsize=3)
+            self.output_queue = queue.Queue(maxsize=3)
+            self.processing_lock = threading.Lock()
+        
+        if self.use_deepfilter:
+            try:
+                print("  🎵 Loading DeepFilterNet model...")
+                self.model, self.df_state, _ = init_df()
+                self.model.eval()
+                print("  ✅ Audio processor ready (DeepFilterNet)")
+                
+                # Start processing worker
+                self.worker_thread = threading.Thread(target=self._process_audio_worker, daemon=True)
+                self.worker_thread.start()
+            except Exception as e:
+                print(f"  ⚠️ DeepFilterNet init failed: {e}")
+                self.use_deepfilter = False
+                print("  🎵 Using simple audio dampening (no DeepFilterNet)")
+        elif self.available:
+            print("  🎵 Audio processor ready (simple dampening mode)")
+    
+    def _process_audio_worker(self):
+        """Worker thread that processes audio asynchronously (DeepFilterNet only)."""
+        if not self.use_deepfilter:
+            return
+            
+        while True:
+            try:
+                audio_data = self.input_queue.get(timeout=0.1)
+                if audio_data is None:  # Shutdown signal
+                    break
+                
+                # Convert to torch tensor
+                audio_tensor = torch.from_numpy(audio_data).float().unsqueeze(0)
+                
+                # Process with DeepFilterNet
+                try:
+                    with torch.no_grad():
+                        enhanced = enhance(self.model, self.df_state, audio_tensor)
+                    
+                    enhanced_np = enhanced.squeeze().cpu().numpy()
+                    
+                    try:
+                        self.output_queue.put_nowait(enhanced_np)
+                    except queue.Full:
+                        try:
+                            self.output_queue.get_nowait()
+                            self.output_queue.put_nowait(enhanced_np)
+                        except queue.Empty:
+                            pass
+                except Exception as e:
+                    print(f"⚠️ Audio enhance error: {e}")
+                
+                self.input_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"⚠️ Audio processing error: {e}")
+                continue
+    
+    def _audio_callback(self, indata, outdata, frames, time, status):
+        """Audio stream callback - processes or passes through audio."""
+        if not self.voice_isolation_enabled:
+            # Passthrough mode
+            outdata[:, 0] = indata[:, 0]
+            return
+        
+        # Voice isolation mode
+        if self.use_deepfilter:
+            # Use DeepFilterNet for advanced noise suppression
+            audio_out = indata[:, 0].copy()
+            
+            # Queue input for processing
+            try:
+                self.input_queue.put_nowait(indata[:, 0].copy())
+            except queue.Full:
+                pass
+            
+            # Try to get processed audio
+            try:
+                enhanced = self.output_queue.get_nowait()
+                if len(enhanced) >= frames:
+                    audio_out = enhanced[:frames]
+                else:
+                    audio_out = np.pad(enhanced, (0, frames - len(enhanced)), mode="constant")
+            except queue.Empty:
+                # Use passthrough if processing is slow
+                pass
+            
+            outdata[:, 0] = audio_out
+        else:
+            # Simple dampening mode: reduce volume of surrounding audio
+            # This is a basic low-pass filter effect to dampen background noise
+            audio_in = indata[:, 0].copy()
+            
+            # Apply volume reduction (dampen by 70%)
+            dampened = audio_in * 0.3  # Keep only 30% of original volume
+            
+            # Simple low-pass filter to reduce high-frequency noise
+            # (very basic - just smooth the signal)
+            if len(dampened) > 1:
+                # Simple moving average for smoothing
+                smoothed = np.convolve(dampened, np.ones(3)/3, mode='same')
+                outdata[:, 0] = smoothed[:frames] if len(smoothed) >= frames else dampened[:frames]
+            else:
+                outdata[:, 0] = dampened[:frames]
+    
+    def start_audio_stream(self):
+        """Start the audio processing stream."""
+        if not self.available or self.is_active:
+            return
+        
+        try:
+            self.audio_stream = sd.Stream(
+                samplerate=self.fs,
+                blocksize=self.blocksize,
+                channels=1,
+                dtype="float32",
+                callback=self._audio_callback,
+                latency="low"
+            )
+            self.audio_stream.start()
+            self.is_active = True
+            print("  🎵 Audio stream started")
+        except Exception as e:
+            print(f"  ⚠️ Failed to start audio stream: {e}")
+    
+    def stop_audio_stream(self):
+        """Stop the audio processing stream."""
+        if self.audio_stream and self.is_active:
+            try:
+                self.audio_stream.stop()
+                self.audio_stream.close()
+                self.is_active = False
+                print("  🎵 Audio stream stopped")
+            except Exception as e:
+                print(f"  ⚠️ Error stopping audio stream: {e}")
+    
+    def set_voice_isolation(self, enabled):
+        """Enable or disable voice isolation (noise suppression)."""
+        self.voice_isolation_enabled = enabled
+        if enabled:
+            print("  🎵 Voice isolation ENABLED (surrounding audio dampened)")
+        else:
+            print("  🎵 Voice isolation DISABLED (full audio passthrough)")
+    
+    def close(self):
+        """Clean up resources."""
+        self.stop_audio_stream()
+        if self.use_deepfilter and hasattr(self, 'input_queue'):
+            self.input_queue.put(None)  # Signal worker to stop
+
+
 class VoiceListener:
-    """Wake word voice listener - say "hey vibe" to start, "thanks" to stop."""
+    """Wake word voice listener - say "hey vibe" for video, "hey vibe audio" for audio."""
     
     def __init__(self):
         self.recognizer = sr.Recognizer()
@@ -1066,16 +1257,19 @@ class VoiceListener:
         self.recognizer.pause_threshold = 0.8  # Longer pause for natural speech
         
         self.microphone = sr.Microphone()
-        self.command_queue = queue.Queue()
+        self.command_queue = queue.Queue()  # Video commands
+        self.audio_command_queue = queue.Queue()  # Audio commands (separate)
         self.listening = True
         self.is_recording = False  # Currently recording command
         self.is_processing = False  # Processing speech
+        self.recording_mode = None  # "video" or "audio"
         self.last_command = ""
-        self.status = "👂 Listening for 'hey vibe'..."
+        self.status = "👂 Listening for 'hey vibe' or 'hey vibe audio'..."
         self._lock = threading.Lock()
         
-        # Wake words
-        self.wake_phrases = ["hey vibe", "hey v", "hey by", "hey bye"]
+        # Wake words - separate for video and audio
+        self.video_wake_phrases = ["hey vibe"]
+        self.audio_wake_phrases = ["hey vibe audio", "hey vibe audio mode", "audio mode"]
         self.stop_phrases = ["thanks", "thank you", "done", "stop"]
         
         # Calibrate
@@ -1083,14 +1277,17 @@ class VoiceListener:
             print("🎤 Calibrating microphone...")
             self.recognizer.adjust_for_ambient_noise(source, duration=1)
         
-        print("✅ Voice listener ready - say 'hey vibe' to start, 'thanks' to stop")
+        print("✅ Voice listener ready:")
+        print("   • Say 'hey vibe' for video commands")
+        print("   • Say 'hey vibe audio' for audio commands")
+        print("   • Say 'thanks' to process")
         
         # Start continuous listening thread
         self._listening_thread = threading.Thread(target=self._continuous_listen, daemon=True)
         self._listening_thread.start()
     
     def _continuous_listen(self):
-        """Continuously listen for wake word 'hey vibe'."""
+        """Continuously listen for wake words: 'hey vibe' (video) or 'hey vibe audio'."""
         while self.listening:
             # Skip if already recording or processing
             if self.is_recording or self.is_processing:
@@ -1100,27 +1297,47 @@ class VoiceListener:
             try:
                 with self.microphone as source:
                     # Listen for wake word (short timeout)
-                    audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=2)
+                    audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=3)
                 
                 try:
                     text = self.recognizer.recognize_google(audio).lower()
                     
-                    # Check for wake word
-                    if any(phrase in text for phrase in self.wake_phrases):
+                    # Check for audio wake word first (longer phrase)
+                    if any(phrase in text for phrase in self.audio_wake_phrases):
                         # Double-check we're not already recording
                         with self._lock:
                             if not self.is_recording and not self.is_processing:
                                 self.is_recording = True
+                                self.recording_mode = "audio"
                             else:
                                 continue  # Already recording, skip
                         
-                        self.status = "🔴 RECORDING... say your command, then 'thanks'"
-                        print("🎤 Wake word detected! Listening for command...")
+                        self.status = "🎵 AUDIO MODE - say your audio command, then 'thanks'"
+                        print("🎵 Audio wake word detected! Listening for audio command...")
                         
                         # Small delay to ensure microphone is released
                         time.sleep(0.3)
                         
-                        # Start recording command (will use its own microphone instance)
+                        # Start recording audio command
+                        threading.Thread(target=self._record_command, daemon=True).start()
+                    
+                    # Check for video wake word
+                    elif any(phrase in text for phrase in self.video_wake_phrases):
+                        # Double-check we're not already recording
+                        with self._lock:
+                            if not self.is_recording and not self.is_processing:
+                                self.is_recording = True
+                                self.recording_mode = "video"
+                            else:
+                                continue  # Already recording, skip
+                        
+                        self.status = "🔴 RECORDING... say your command, then 'thanks'"
+                        print("🎤 Video wake word detected! Listening for command...")
+                        
+                        # Small delay to ensure microphone is released
+                        time.sleep(0.3)
+                        
+                        # Start recording video command
                         threading.Thread(target=self._record_command, daemon=True).start()
                     
                 except sr.UnknownValueError:
@@ -1216,18 +1433,26 @@ class VoiceListener:
                     self.is_processing = True
                 
                 self.last_command = full_command
+                
+                # Route to appropriate queue based on mode
+                if self.recording_mode == "audio":
+                    self.audio_command_queue.put(full_command)
+                    self.status = f"🎵 Audio: {full_command[:40]}..."
+                    print(f"🎵 Audio command: {full_command}")
+                else:  # video mode
                 self.command_queue.put(full_command)
                 self.status = f"✅ Got: {full_command[:40]}..."
-                print(f"🗣️ Command: {full_command}")
+                    print(f"🗣️ Video command: {full_command}")
             else:
-                self.status = "👂 Listening for 'hey vibe'..."
+                self.status = "👂 Listening for 'hey vibe' or 'hey vibe audio'..."
         else:
-            self.status = "👂 Listening for 'hey vibe'..."
+            self.status = "👂 Listening for 'hey vibe' or 'hey vibe audio'..."
         
         # Reset state
         with self._lock:
             self.is_recording = False
             self.is_processing = False
+            self.recording_mode = None
     
     def start_recording(self):
         """Legacy method - no longer used (wake word handles this)."""
@@ -1243,9 +1468,16 @@ class VoiceListener:
             return self.is_recording or self.is_processing
     
     def get_command(self):
-        """Get next command from queue (non-blocking)."""
+        """Get next video command from queue (non-blocking)."""
         try:
             return self.command_queue.get_nowait()
+        except queue.Empty:
+            return None
+    
+    def get_audio_command(self):
+        """Get next audio command from queue (non-blocking)."""
+        try:
+            return self.audio_command_queue.get_nowait()
         except queue.Empty:
             return None
     
@@ -1368,6 +1600,12 @@ class EnvironmentController:
         
         # Voice listener
         self.voice = VoiceListener()
+        
+        # Audio processor (for voice isolation and audio modulation)
+        self.audio_processor = AudioProcessor()
+        if self.audio_processor.available:
+            # Start audio stream (will be controlled by commands)
+            self.audio_processor.start_audio_stream()
         
         # State
         self.masks = []  # List of (mask, label, center)
@@ -1616,10 +1854,15 @@ class EnvironmentController:
             # Sync adaptive thresholds with feedback loop optimizations
             self._sync_thresholds()
         
-        # Check for voice commands
+        # Check for video commands
         command = self.voice.get_command()
         if command:
             self._process_voice_command(command)
+        
+        # Check for audio commands (separate pipeline)
+        audio_command = self.voice.get_audio_command()
+        if audio_command:
+            self._process_audio_command(audio_command)
         
         # Optional autopilot to keep generating requests during the online training loop
         self._autopilot_step()
@@ -2594,6 +2837,42 @@ class EnvironmentController:
         else:
             print(f"🎨 Applied {applied_count} effect(s)")
     
+    def _process_audio_command(self, command):
+        """Process an audio command - completely separate from video pipeline."""
+        print(f"\n{'='*50}")
+        print(f"🎵 Processing AUDIO command: '{command}'")
+        
+        if not self.audio_processor.available:
+            print("  ⚠️ Audio processor not available (missing dependencies)")
+            return
+        
+        command_lower = command.lower()
+        
+        # Parse audio commands
+        # Enable voice isolation (dampen surrounding audio)
+        if any(phrase in command_lower for phrase in [
+            "dampen", "damp", "reduce", "suppress", "isolate", "voice isolation",
+            "noise suppression", "quiet", "mute background", "background noise"
+        ]):
+            self.audio_processor.set_voice_isolation(True)
+            print("  ✅ Voice isolation ENABLED - surrounding audio dampened")
+        
+        # Disable voice isolation (full audio)
+        elif any(phrase in command_lower for phrase in [
+            "disable", "turn off", "stop", "full audio", "passthrough",
+            "normal audio", "all audio"
+        ]):
+            self.audio_processor.set_voice_isolation(False)
+            print("  ✅ Voice isolation DISABLED - full audio passthrough")
+        
+        # Toggle
+        elif "toggle" in command_lower:
+            new_state = not self.audio_processor.voice_isolation_enabled
+            self.audio_processor.set_voice_isolation(new_state)
+        
+        else:
+            print(f"  ❓ Unknown audio command. Try: 'dampen surrounding audio' or 'disable voice isolation'")
+    
     def _direct_text_matching(self, command, available_labels):
         """Direct text matching fallback when Gemini fails - with ACCESSIBILITY MODES."""
         command_lower = command.lower()
@@ -3058,6 +3337,8 @@ class EnvironmentController:
     
     def close(self):
         self.voice.stop()
+        if self.audio_processor:
+            self.audio_processor.close()
         self.selfie.close()
         self.face_mesh.close()
         self.hands.close()
