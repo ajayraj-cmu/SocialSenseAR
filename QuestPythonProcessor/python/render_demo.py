@@ -69,10 +69,18 @@ def extract_audio(video_path: Path, audio_path: Path) -> bool:
         return False
 
 
-def mux_audio(video_path: Path, audio_source: Path, output_path: Path, fps: float = 30.0) -> bool:
+def mux_audio(video_path: Path, audio_source: Path, output_path: Path, fps: float = 30.0, width: int = None, height: int = None) -> bool:
     """Re-encode video with H.264 and mux audio from source using ffmpeg.
 
     This fixes jittering by using proper H.264 encoding with constant frame rate.
+
+    Args:
+        video_path: Not used directly (output_path is renamed to temp)
+        audio_source: Original video to take audio from
+        output_path: Final output path
+        fps: Frame rate for output
+        width: Video width (if None, will probe from temp file)
+        height: Video height (if None, will probe from temp file)
     """
     import subprocess
     ffmpeg = find_ffmpeg()
@@ -80,7 +88,10 @@ def mux_audio(video_path: Path, audio_source: Path, output_path: Path, fps: floa
         print("[AUDIO] ffmpeg not found, output will have no audio")
         return False
 
-    print(f"[FFMPEG] Re-encoding with H.264 and adding audio...")
+    if width is not None and height is not None:
+        print(f"[FFMPEG] Re-encoding with H.264 and adding audio (preserving {width}x{height})...")
+    else:
+        print(f"[FFMPEG] Re-encoding with H.264 and adding audio...")
     temp_output = output_path.with_suffix('.temp.mp4')
 
     try:
@@ -90,6 +101,16 @@ def mux_audio(video_path: Path, audio_source: Path, output_path: Path, fps: floa
         video_path_to_mux = output_path
         video_path_to_mux.rename(temp_output)
 
+        # Build the video filter to preserve exact dimensions and set square pixels
+        vf_filters = ['setsar=1:1']  # Set sample aspect ratio to 1:1 (square pixels)
+
+        # If dimensions provided, add scale filter to ensure exact match
+        if width is not None and height is not None:
+            # Use scale with exact dimensions, no padding
+            vf_filters.insert(0, f'scale={width}:{height}:force_original_aspect_ratio=disable')
+
+        vf_string = ','.join(vf_filters)
+
         cmd = [
             ffmpeg, '-y',
             '-i', str(temp_output),       # Rendered video (no audio)
@@ -98,6 +119,7 @@ def mux_audio(video_path: Path, audio_source: Path, output_path: Path, fps: floa
             '-preset', 'fast',            # Encoding speed/quality tradeoff
             '-crf', '18',                 # Quality (lower = better, 18 is visually lossless)
             '-r', str(fps),               # Force constant frame rate
+            '-vf', vf_string,             # Video filters: scale + setsar for exact dimensions
             '-pix_fmt', 'yuv420p',        # Compatibility
             '-c:a', 'aac',                # Encode audio as AAC
             '-b:a', '192k',               # Audio bitrate
@@ -412,7 +434,8 @@ def render_demo_video(
     print(f"{'='*60}\n")
 
     # Re-encode with H.264 and mux audio from original video
-    mux_audio(output_path, input_path, output_path, fps=input_fps)
+    # Pass width and height to ensure output dimensions match input exactly
+    mux_audio(output_path, input_path, output_path, fps=input_fps, width=width, height=height)
 
     print(f"Output saved to: {output_path}")
 

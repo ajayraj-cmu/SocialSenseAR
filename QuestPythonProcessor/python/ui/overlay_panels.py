@@ -108,6 +108,11 @@ class OverlayRenderer:
         # Speaking indicator animation
         self._speaking_pulse = 0.0
 
+        # Quest mode: use Quest-friendly positioning even for mono videos
+        # When True, mono videos will use the larger base_x offset and scaled panel width
+        # that stereo mode uses, positioning panels more toward center
+        self.force_quest_mode = True
+
         # Clear any stale state file on init
         self._clear_stale_state()
 
@@ -629,6 +634,141 @@ class OverlayRenderer:
 
         return frame
 
+    def _draw_speaking_indicator_at_pos(self, frame: np.ndarray, ind_x: int, ind_y: int,
+                                         is_speaking: bool, alpha: float = 1.0) -> np.ndarray:
+        """Draw speaking indicator at a specific position (top-left corner).
+
+        Args:
+            frame: Video frame to draw on
+            ind_x: X position of indicator (left edge)
+            ind_y: Y position of indicator (top edge)
+            is_speaking: Whether the other person is speaking
+            alpha: Animation alpha for fade effect
+        """
+        if alpha <= 0.01:
+            return frame
+
+        h, w = frame.shape[:2]
+
+        # Update pulse animation
+        self._speaking_pulse = (self._speaking_pulse + 0.15) % (2 * math.pi)
+        pulse = 0.5 + 0.5 * math.sin(self._speaking_pulse)
+
+        indicator_width = self.indicator_width
+        indicator_height = self.indicator_height
+        radius = self.indicator_radius
+
+        # Clamp to bounds
+        ind_x = max(5, min(ind_x, w - indicator_width - 5))
+        ind_y = max(5, min(ind_y, h - indicator_height - 5))
+
+        # --- Glassmorphism background ---
+        x1, y1 = max(0, ind_x - 2), max(0, ind_y - 2)
+        x2, y2 = min(w, ind_x + indicator_width + 2), min(h, ind_y + indicator_height + 2)
+
+        if x2 > x1 and y2 > y1:
+            # Create rounded rect mask
+            mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
+            mask_w, mask_h = x2 - x1, y2 - y1
+
+            # Draw rounded rectangle in mask
+            cv2.rectangle(mask, (radius, 0), (mask_w - radius, mask_h), 255, -1)
+            cv2.rectangle(mask, (0, radius), (mask_w, mask_h - radius), 255, -1)
+            cv2.circle(mask, (radius, radius), radius, 255, -1)
+            cv2.circle(mask, (mask_w - radius, radius), radius, 255, -1)
+            cv2.circle(mask, (radius, mask_h - radius), radius, 255, -1)
+            cv2.circle(mask, (mask_w - radius, mask_h - radius), radius, 255, -1)
+
+            # Get region and fast blur
+            region = frame[y1:y2, x1:x2].copy()
+            rh, rw = region.shape[:2]
+            if rw > 8 and rh > 8:
+                small = cv2.resize(region, (rw // 4, rh // 4), interpolation=cv2.INTER_AREA)
+                small_blur = cv2.GaussianBlur(small, (5, 5), 0)
+                blurred = cv2.resize(small_blur, (rw, rh), interpolation=cv2.INTER_LINEAR)
+            else:
+                blurred = cv2.GaussianBlur(region, (7, 7), 0)
+
+            # Dark tint blend
+            blended = cv2.addWeighted(blurred, 0.25, np.full_like(blurred, (22, 22, 28), dtype=np.uint8), 0.75, 0)
+
+            # Apply with mask
+            mask_float = mask.astype(np.float32) * (0.88 * alpha / 255.0)
+            mask_3ch = cv2.merge([mask_float, mask_float, mask_float])
+            result = blended.astype(np.float32) * mask_3ch + region.astype(np.float32) * (1.0 - mask_3ch)
+            frame[y1:y2, x1:x2] = np.clip(result, 0, 255).astype(np.uint8)
+
+            # Subtle border
+            border_color = (255, 255, 255)
+            border_region = frame[y1:y2, x1:x2].copy()
+            ox, oy = ind_x - x1, ind_y - y1
+
+            cv2.line(border_region, (ox + radius, oy), (ox + indicator_width - radius, oy), border_color, 1)
+            cv2.line(border_region, (ox + radius, oy + indicator_height), (ox + indicator_width - radius, oy + indicator_height), border_color, 1)
+            cv2.line(border_region, (ox, oy + radius), (ox, oy + indicator_height - radius), border_color, 1)
+            cv2.line(border_region, (ox + indicator_width, oy + radius), (ox + indicator_width, oy + indicator_height - radius), border_color, 1)
+
+            cv2.ellipse(border_region, (ox + radius, oy + radius), (radius, radius), 180, 0, 90, border_color, 1)
+            cv2.ellipse(border_region, (ox + indicator_width - radius, oy + radius), (radius, radius), 270, 0, 90, border_color, 1)
+            cv2.ellipse(border_region, (ox + radius, oy + indicator_height - radius), (radius, radius), 90, 0, 90, border_color, 1)
+            cv2.ellipse(border_region, (ox + indicator_width - radius, oy + indicator_height - radius), (radius, radius), 0, 0, 90, border_color, 1)
+
+            frame[y1:y2, x1:x2] = cv2.addWeighted(border_region, 0.15 * alpha, frame[y1:y2, x1:x2], 1 - 0.15 * alpha, 0)
+
+        # --- Draw content (dot + text) ---
+        dot_size = max(8, int(10 * self._cached_scale))
+        text_gap = max(8, int(10 * self._cached_scale))
+        text = "SPEAKING" if is_speaking else "YOUR TURN"
+
+        # Measure text using font metrics for proper vertical centering
+        temp_img = Image.new('RGB', (1, 1))
+        temp_draw = ImageDraw.Draw(temp_img)
+        bbox = temp_draw.textbbox((0, 0), text, font=self._font_indicator)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        text_y_offset = bbox[1]  # Top offset from baseline
+
+        # Center content horizontally and vertically
+        content_width = (dot_size * 2) + text_gap + text_w
+        content_start_x = ind_x + (indicator_width - content_width) // 2
+        indicator_center_y = ind_y + indicator_height // 2
+
+        dot_center_x = content_start_x + dot_size
+        dot_y = indicator_center_y
+        text_x = content_start_x + (dot_size * 2) + text_gap
+
+        # Draw pulsing dot
+        if is_speaking:
+            dot_color = (50, 205, 50)  # Green
+            current_dot_size = int(dot_size * (0.85 + 0.15 * pulse))
+        else:
+            dot_color = (70, 130, 180)  # Steel blue
+            current_dot_size = dot_size
+
+        cv2.circle(frame, (dot_center_x, dot_y), current_dot_size, dot_color, -1, cv2.LINE_AA)
+
+        # Draw text with PIL - use indicator bounds directly for proper centering
+        tx1, ty1 = max(0, ind_x), max(0, ind_y)
+        tx2, ty2 = min(w, ind_x + indicator_width), min(h, ind_y + indicator_height)
+
+        if tx2 > tx1 and ty2 > ty1:
+            text_region = frame[ty1:ty2, tx1:tx2].copy()
+            pil_image = Image.fromarray(cv2.cvtColor(text_region, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(pil_image)
+
+            # Calculate text position relative to region
+            local_text_x = text_x - tx1
+            # Center vertically: position text so its visual center aligns with indicator center
+            region_center_y = (ty2 - ty1) // 2
+            local_text_y = region_center_y - text_h // 2 - text_y_offset
+
+            text_color = (255, 255, 255, int(230 * alpha))
+            draw.text((local_text_x, local_text_y), text, font=self._font_indicator, fill=text_color)
+
+            frame[ty1:ty2, tx1:tx2] = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+
+        return frame
+
     def _update_toasts(self, state: dict) -> None:
         """Update toast notifications from state."""
         now = time.time()
@@ -824,6 +964,9 @@ class OverlayRenderer:
         aspect = w / h
         is_stereo = aspect > 2.0
 
+        # Use Quest-style positioning if stereo OR if force_quest_mode is enabled
+        use_quest_positioning = is_stereo or self.force_quest_mode
+
         # Draw each toast (only most recent one to avoid clutter)
         toast = self._active_toasts[-1]  # Most recent toast
 
@@ -839,7 +982,7 @@ class OverlayRenderer:
         toast_alpha *= alpha
 
         # Position toast - higher for Quest to avoid being cut off
-        if is_stereo:
+        if use_quest_positioning:
             base_y = h - int(120 * self._cached_scale)  # Higher for Quest
         else:
             base_y = h - int(55 * self._cached_scale)  # Position near bottom (scaled)
@@ -901,6 +1044,11 @@ class OverlayRenderer:
         raw_emotion = state.get("emotion_display") or state.get("emotion") or state.get("emotion_label") or "Neutral"
         is_speaking = state.get("is_other_speaking", False)
 
+        # Get recent utterances list for stacked captions (baseball-style rolling captions)
+        utterances = state.get("recent_utterances", [])
+        if not utterances and utterance:
+            utterances = [utterance]  # Fallback to single utterance
+
         # Map emotions and get corresponding emoji
         emotion, emotion_emoji = self._map_emotion(raw_emotion)
 
@@ -908,12 +1056,11 @@ class OverlayRenderer:
         aspect = w / h
         is_stereo = aspect > 2.0
 
-        # Draw speaking indicator above head
-        if profile_enabled: t0 = time.time()
-        frame = self._draw_speaking_indicator(frame, head_x, head_y, is_speaking, anim_progress)
-        if profile_enabled: timings['speaking_ind'] = (time.time() - t0) * 1000
+        # Use Quest-style positioning if stereo OR if force_quest_mode is enabled
+        # This allows mono videos meant for Quest viewing to have proper positioning
+        use_quest_positioning = is_stereo or self.force_quest_mode
 
-        # Calculate panel dimensions
+        # Calculate panel dimensions first (needed for speaking indicator positioning)
         line_height_text = int(24 * self._cached_scale)
         line_height_label = int(18 * self._cached_scale)
         section_spacing = int(16 * self._cached_scale)
@@ -927,8 +1074,8 @@ class OverlayRenderer:
 
         # Animated position (slide in from left) - scaled
         # Use larger offset for Quest/stereo to move panels closer to center
-        if is_stereo:
-            base_x = int(220 * self._cached_scale)  # Closer to center for Quest
+        if use_quest_positioning:
+            base_x = int(200 * self._cached_scale)  # Further from center for Quest
         else:
             base_x = int(28 * self._cached_scale)
         slide_offset = int((1 - anim_progress) * -70 * self._cached_scale)  # Slide from left
@@ -945,7 +1092,7 @@ class OverlayRenderer:
             frame = self._draw_panels_single(
                 frame, base_x + slide_offset, h, panel_width,
                 context_height, emotion_height, total_height,
-                anim_progress, convo_summary, question, utterance, emotion, emotion_emoji,
+                anim_progress, convo_summary, question, utterances, emotion, emotion_emoji,
                 timings if profile_enabled else None
             )
             if profile_enabled: timings['panel_L'] = (time.time() - t0) * 1000
@@ -955,20 +1102,92 @@ class OverlayRenderer:
             frame = self._draw_panels_single(
                 frame, half_w + base_x + slide_offset, h, panel_width,
                 context_height, emotion_height, total_height,
-                anim_progress, convo_summary, question, utterance, emotion, emotion_emoji,
+                anim_progress, convo_summary, question, utterances, emotion, emotion_emoji,
                 timings if profile_enabled else None
             )
             if profile_enabled: timings['panel_R'] = (time.time() - t0) * 1000
         else:
-            # Mono mode
+            # Mono mode - use Quest-style panel width if force_quest_mode is enabled
             if profile_enabled: t0 = time.time()
+            if use_quest_positioning:
+                # Use 75% panel width like stereo mode for Quest-friendly positioning
+                mono_panel_width = int(self.panel_width * 0.75)
+                mono_base_x = base_x  # base_x already positioned for Quest, no additional offset
+            else:
+                mono_panel_width = self.panel_width
+                mono_base_x = base_x
             frame = self._draw_panels_single(
-                frame, base_x + slide_offset, h, self.panel_width,
+                frame, mono_base_x + slide_offset, h, mono_panel_width,
                 context_height, emotion_height, total_height,
-                anim_progress, convo_summary, question, utterance, emotion, emotion_emoji,
+                anim_progress, convo_summary, question, utterances, emotion, emotion_emoji,
                 timings if profile_enabled else None
             )
             if profile_enabled: timings['panel'] = (time.time() - t0) * 1000
+
+        # Draw speaking indicator on the RIGHT side, vertically centered with panels
+        if profile_enabled: t0 = time.time()
+        # Panels are vertically centered in frame (same calc as _draw_panels_single)
+        panel_base_y = (h - total_height) // 2
+        # Calculate vertical center of panels, then position indicator so its center aligns
+        panel_vertical_center = panel_base_y + total_height // 2
+        indicator_y = panel_vertical_center - self.indicator_height // 2
+
+        if is_stereo:
+            half_w = w // 2
+            eye_center = half_w // 2  # Center of each eye's view
+
+            # Panel position and width (with animation offset)
+            panel_left_x = base_x + slide_offset
+            # Use the scaled panel width for stereo mode
+            stereo_panel_width = int(min(self.panel_width, half_w - 60) * 0.75)
+
+            # Calculate panel center position
+            panel_center_x = panel_left_x + stereo_panel_width // 2
+
+            # Distance from panel center to eye center
+            dist_from_center = eye_center - panel_center_x
+
+            # Mirror: indicator's CENTER should be same distance to the RIGHT of center
+            indicator_center_x_left = eye_center + dist_from_center
+            indicator_x_left = indicator_center_x_left - self.indicator_width // 2
+
+            indicator_center_x_right = half_w + eye_center + dist_from_center
+            indicator_x_right = indicator_center_x_right - self.indicator_width // 2
+
+            frame = self._draw_speaking_indicator_at_pos(
+                frame, indicator_x_left, indicator_y, is_speaking, anim_progress
+            )
+            frame = self._draw_speaking_indicator_at_pos(
+                frame, indicator_x_right, indicator_y, is_speaking, anim_progress
+            )
+        else:
+            # Mono mode: mirror around frame center
+            frame_center = w // 2
+
+            # Use same panel positioning as rendering (Quest mode uses adjusted values)
+            if use_quest_positioning:
+                mono_panel_width = int(self.panel_width * 0.75)
+                mono_base_x = base_x  # base_x already positioned for Quest, no additional offset
+            else:
+                mono_panel_width = self.panel_width
+                mono_base_x = base_x
+
+            panel_left_x = mono_base_x + slide_offset
+
+            # Calculate panel center position
+            panel_center_x = panel_left_x + mono_panel_width // 2
+
+            # Distance from panel center to frame center
+            dist_from_center = frame_center - panel_center_x
+
+            # Mirror: indicator's CENTER should be same distance to the RIGHT of center
+            indicator_center_x = frame_center + dist_from_center
+            indicator_x = indicator_center_x - self.indicator_width // 2
+
+            frame = self._draw_speaking_indicator_at_pos(
+                frame, indicator_x, indicator_y, is_speaking, anim_progress
+            )
+        if profile_enabled: timings['speaking_ind'] = (time.time() - t0) * 1000
 
         if profile_enabled:
             self._log_profile(timings, time.time() - t_start)
@@ -1008,10 +1227,15 @@ class OverlayRenderer:
     def _draw_panels_single(self, frame: np.ndarray, panel_x: int, frame_h: int,
                             panel_width: int, context_height: int, emotion_height: int,
                             total_height: int, anim_progress: float,
-                            convo_summary: str, question: str, utterance: str,
+                            convo_summary: str, question: str, utterances: List[str],
                             emotion: str, emotion_emoji: str,
                             _timings: dict = None) -> np.ndarray:
-        """Draw the info panels at a specific x position."""
+        """Draw the info panels at a specific x position.
+
+        Args:
+            utterances: List of recent utterances for stacked/rolling captions (baseball-style).
+                       Most recent utterance should be last in the list (displayed at bottom).
+        """
         _t = _timings is not None
 
         line_height_text = int(24 * self._cached_scale)
@@ -1098,15 +1322,46 @@ class OverlayRenderer:
             y += line_height_text
         y += section_spacing
 
-        # JUST SAID
+        # JUST SAID - stacked/rolling captions like baseball game captions
         draw.text((text_x, y), "JUST SAID", font=self._font_label, fill=label_a)
         y += line_height_label
 
-        utt_text = f'"{utterance}"' if utterance else "..."
-        utt_lines = self._wrap_text(draw, utt_text, self._font_text, max_text_width)
-        for line in utt_lines[:2]:
-            draw.text((text_x, y), line, font=self._font_text, fill=white_a)
-            y += line_height_text
+        # Use smaller line height for utterances to fit more lines
+        utt_line_height = int(20 * self._cached_scale)
+
+        if not utterances:
+            # No utterances - show "Listening..." instead of "..."
+            draw.text((text_x, y), "Listening...", font=self._font_text, fill=dim_a)
+            y += utt_line_height
+        else:
+            # Display stacked utterances - older ones dimmer, most recent at bottom
+            # Limit to 2 utterances max, 1 line each for compact display
+            max_utterances = 2
+            display_utterances = utterances[-2:]  # Take last N (most recent)
+
+            for i, utt in enumerate(display_utterances):
+                # Calculate opacity: older utterances are dimmer
+                # First utterance (oldest) is dimmest, last (most recent) is brightest
+                is_most_recent = (i == len(display_utterances) - 1)
+
+                if is_most_recent:
+                    # Most recent utterance - full brightness
+                    utt_fill = white_a
+                else:
+                    # Older utterances - progressively dimmer
+                    # Calculate dimness based on position (0 = oldest, len-1 = newest)
+                    dim_factor = 0.5 + (0.3 * i / max(1, len(display_utterances) - 1))
+                    dim_value = int(180 * dim_factor)
+                    utt_fill = (dim_value, dim_value, dim_value, text_alpha)
+
+                # Format utterance with quotes
+                utt_text = f'"{utt}"' if utt else ""
+
+                # Wrap text and allow only 1 line per utterance to prevent overflow
+                utt_lines = self._wrap_text(draw, utt_text, self._font_text, max_text_width)
+                for line in utt_lines[:1]:  # Only 1 line per utterance to fit in panel
+                    draw.text((text_x, y), line, font=self._font_text, fill=utt_fill)
+                    y += utt_line_height
 
         # === EMOTION PANEL (split into two halves) ===
         y = local_emotion_y + self.padding_y
