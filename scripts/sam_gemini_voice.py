@@ -72,13 +72,45 @@ except ImportError:
     GEMINI_AVAILABLE = False
     print("⚠️  google-generativeai not installed. Run: pip install google-generativeai")
 
+# Overshoot Vision API (optional - enhanced labeling)
+try:
+    from overshoot_client import OvershootLabeler, is_overshoot_available
+    OVERSHOOT_AVAILABLE = is_overshoot_available()
+except ImportError:
+    OVERSHOOT_AVAILABLE = False
+    OvershootLabeler = None
+
 
 class GeminiAgent:
-    """Handles Gemini text and vision processing."""
+    """Handles Gemini text and vision processing + Overshoot integration."""
     
     def __init__(self):
         # Prioritize GEMINI_API_KEY, fallback to GOOGLE_API_KEY
         self.api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        
+        # ==========================================
+        # OVERSHOOT VISION API (optional backend)
+        # ==========================================
+        self.overshoot_labeler = None
+        self.use_overshoot = False
+        overshoot_key = os.environ.get("OVERSHOOT_API_KEY", "")
+        if overshoot_key and overshoot_key != "your-overshoot-api-key-here" and OVERSHOOT_AVAILABLE:
+            try:
+                print(f"  🔧 Initializing Overshoot (key length: {len(overshoot_key)})...")
+                self.overshoot_labeler = OvershootLabeler(api_key=overshoot_key, debug=True)
+                self.use_overshoot = self.overshoot_labeler.available
+                if self.use_overshoot:
+                    print("  ✓ Overshoot Vision API (enhanced labeling)")
+                else:
+                    print("  ⚠️ Overshoot initialized but not available")
+            except Exception as e:
+                print(f"  ⚠️ Overshoot init failed: {e}")
+                import traceback
+                traceback.print_exc()
+        elif overshoot_key and overshoot_key == "your-overshoot-api-key-here":
+            print("  ⚠️ OVERSHOOT_API_KEY is still placeholder - update .env with real key")
+        elif not OVERSHOOT_AVAILABLE:
+            print("  ⚠️ Overshoot dependencies not available (aiortc/aiohttp)")
         
         self.scene_objects = []
         self.last_scene_analysis = None
@@ -86,11 +118,14 @@ class GeminiAgent:
         
         # ==========================================
         # GEMINI API RATE LIMITING
+        # Using Overshoot when available, Gemini as fallback only
         # ==========================================
+        # Track which API is being used
+        self.last_api_used = "none"
         self.vision_call_count = 0
         self.last_vision_call = 0
-        self.min_vision_interval = 2.0  # Minimum 2 seconds between vision API calls
-        self.max_vision_calls_per_minute = 10  # Limit vision calls per minute
+        self.min_vision_interval = 5.0  # Minimum 5 seconds between Gemini vision calls (conservative)
+        self.max_vision_calls_per_minute = 3  # Max 3 Gemini calls per minute (very conservative)
         self.vision_calls_this_minute = 0
         self.minute_start = time.time()
         
@@ -195,9 +230,80 @@ class GeminiAgent:
         self.last_vision_call = time.time()
     
     def label_all_segments(self, frame, masks_with_centers):
-        """Use Gemini Vision to label ALL SAM segments - OPEN VOCABULARY detection."""
-        if not self.available or not self._can_call_vision():
-            return None
+        """Use BOTH Overshoot AND Gemini Vision to label ALL SAM segments - COMBINED APPROACH."""
+        
+        combined_labels = {}
+        overshoot_labels = {}
+        gemini_labels = {}
+        
+        # ==========================================
+        # STEP 1: GET OVERSHOOT LABELS (if available)
+        # ==========================================
+        if self.use_overshoot and self.overshoot_labeler:
+            try:
+                overshoot_labels = self.overshoot_labeler.label_segments(frame, masks_with_centers)
+                if overshoot_labels:
+                    print(f"  🎯 Overshoot: {', '.join(list(overshoot_labels.values())[:8])}")
+                    combined_labels.update(overshoot_labels)  # Start with Overshoot labels
+            except Exception as e:
+                print(f"  ⚠️ Overshoot error: {e}")
+        
+        # ==========================================
+        # STEP 2: GET GEMINI VISION LABELS (if available and within rate limits)
+        # ==========================================
+        if self.available and self._can_call_vision():
+            try:
+                print(f"  📡 Using Gemini Vision (rate limited: {self.vision_calls_this_minute}/{self.max_vision_calls_per_minute} this minute)")
+                gemini_labels = self._get_gemini_labels(frame, masks_with_centers)
+                if gemini_labels:
+                    print(f"  🏷️ Gemini: {', '.join(list(gemini_labels.values())[:8])}")
+                    # Merge Gemini labels - prefer Gemini for missing indices, but keep Overshoot if both exist
+                    for idx, label in gemini_labels.items():
+                        if idx not in combined_labels:  # Only add if Overshoot didn't label it
+                            combined_labels[idx] = label
+                        else:
+                            # Both labeled it - prefer more specific label
+                            overshoot_label = combined_labels[idx]
+                            gemini_label = label
+                            # Keep the more specific one (longer or more descriptive)
+                            if len(gemini_label) > len(overshoot_label) or gemini_label not in ["object", "item", "thing"]:
+                                combined_labels[idx] = gemini_label
+                            else:
+                                combined_labels[idx] = overshoot_label
+            except Exception as e:
+                if "404" not in str(e) and "Resource" not in str(e):
+                    print(f"  ⚠️ Gemini labeling: {str(e)[:50]}")
+        
+        # ==========================================
+        # STEP 3: FILL IN MISSING LABELS WITH SMART FALLBACK
+        # ==========================================
+        if len(combined_labels) < len(masks_with_centers):
+            fallback_labels = self._smart_fallback_labels(masks_with_centers, frame)
+            if fallback_labels:
+                for idx, label in fallback_labels.items():
+                    if idx not in combined_labels:
+                        combined_labels[idx] = label
+                missing_count = len([i for i in fallback_labels.keys() if i not in combined_labels])
+                if missing_count > 0:
+                    print(f"  🔄 Fallback filled {missing_count} missing labels")
+        
+        # Track which APIs were used
+        if overshoot_labels and gemini_labels:
+            self.last_api_used = "both"
+        elif overshoot_labels:
+            self.last_api_used = "overshoot"
+        elif gemini_labels:
+            self.last_api_used = "gemini"
+        else:
+            self.last_api_used = "fallback"
+        
+        if combined_labels:
+            print(f"  ✅ Combined: {len(combined_labels)} labels from {self.last_api_used}")
+        
+        return combined_labels if combined_labels else None
+    
+    def _get_gemini_labels(self, frame, masks_with_centers):
+        """Get labels from Gemini Vision API."""
         
         try:
             # Convert frame to PIL Image
@@ -251,25 +357,21 @@ Return ONLY this JSON format:
             
             # Convert to dict: region_index -> label
             labels = {}
-            label_list = []
             for item in results:
                 region = item.get("region", 0) - 1  # Convert to 0-indexed
                 label = item.get("label", "unknown").lower().strip()
                 if 0 <= region < len(masks_with_centers) and label:
                     labels[region] = label
-                    label_list.append(label)
             
-            if label_list:
-                print(f"  🏷️ Gemini: {', '.join(label_list[:8])}{'...' if len(label_list) > 8 else ''}")
             return labels
             
         except json.JSONDecodeError as e:
-            print(f"  ⚠️ Gemini JSON parse error - using smart fallback")
-            return self._smart_fallback_labels(masks_with_centers, frame)
+            print(f"  ⚠️ Gemini JSON parse error")
+            return {}
         except Exception as e:
             if "404" not in str(e) and "Resource" not in str(e):
-                print(f"  ⚠️ Gemini labeling: {str(e)[:50]} - using fallback")
-            return self._smart_fallback_labels(masks_with_centers, frame)
+                print(f"  ⚠️ Gemini labeling: {str(e)[:50]}")
+            return {}
     
     def _smart_fallback_labels(self, masks_with_centers, frame):
         """Smart fallback labeling based on mask position, size, and brightness."""
@@ -3095,6 +3197,9 @@ class EnvironmentController:
         self.face_mesh.close()
         self.hands.close()
         self.pose.close()
+        # Clean up Overshoot client if used
+        if self.gemini and self.gemini.overshoot_labeler:
+            self.gemini.overshoot_labeler.close()
 
 
 class AsyncCamera:
