@@ -92,6 +92,9 @@ GLASS_HTML = """
             max-height: 100%;
             object-fit: contain;
             border-radius: 8px;
+            /* Crisp rendering - prevents blurry scaling */
+            image-rendering: -webkit-optimize-contrast;
+            image-rendering: crisp-edges;
         }
 
         .glass-panel {
@@ -306,7 +309,7 @@ GLASS_HTML = """
             try {
                 const frame = await pywebview.api.get_frame();
                 if (frame) {
-                    videoFrame.src = 'data:image/jpeg;base64,' + frame;
+                    videoFrame.src = 'data:image/png;base64,' + frame;
                 }
             } catch (e) {
                 console.error('Frame error:', e);
@@ -377,6 +380,8 @@ class WebViewUI(BaseUI):
         self.window = None
         self._thread = None
         self._ready = threading.Event()
+        # Higher quality for better text readability (default was 85)
+        self.jpeg_quality = getattr(config, 'webview_jpeg_quality', 98) if config else 98
 
     def _run_webview(self, title: str):
         """Run webview in separate thread."""
@@ -417,8 +422,8 @@ class WebViewUI(BaseUI):
         if self.window is None:
             return
 
-        # Encode frame as JPEG base64
-        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        # Encode frame as PNG base64 (lossless for crisp text)
+        _, buffer = cv2.imencode('.png', frame)
         self.api._current_frame_b64 = base64.b64encode(buffer).decode('utf-8')
 
         # Update stats

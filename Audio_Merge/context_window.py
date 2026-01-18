@@ -132,7 +132,7 @@ CONVO_HELPER_HTML = """
 
         .sub-context {
             font-size: 12px;
-            color: rgba(255, 255, 255, 0.7);
+            color: rgba(255, 255, 255, 0.95);
             line-height: 1.3;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -170,7 +170,7 @@ CONVO_HELPER_HTML = """
         .question-text {
             font-size: 13px;
             font-weight: 500;
-            color: #e0e7ff;
+            color: rgba(255, 255, 255, 0.95);
             line-height: 1.3;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -195,7 +195,7 @@ CONVO_HELPER_HTML = """
 
         .utterance-text {
             font-size: 11px;
-            color: rgba(255, 255, 255, 0.6);
+            color: rgba(255, 255, 255, 0.95);
             line-height: 1.35;
             font-style: italic;
             overflow: hidden;

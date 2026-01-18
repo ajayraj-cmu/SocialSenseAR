@@ -9,7 +9,7 @@ To add a new preset:
 2. Optionally set as ACTIVE_PRESET default
 """
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 import argparse
 
 
@@ -75,7 +75,7 @@ class Config:
         transition_duration: Effect transition time in seconds
     """
     # Component selection
-    source: str = "quest"
+    source: str = "quest_tcp"
     processor: str = "yolo"
     effect: str = "focus"
     ui: str = "opencv"
@@ -98,6 +98,19 @@ class Config:
 
     # Transition
     transition_duration: float = 1.0
+
+    # TCP streaming quality (0-100, higher = better quality but larger size)
+    jpeg_quality: int = 92
+
+    # Audio processing
+    audio_enabled: bool = True
+    audio_services: List[str] = field(default_factory=lambda: ["context"])
+    audio_state_dir: str = "~/Downloads/Nex/conve_context"
+    audio_mic1_index: Optional[int] = None  # User mic (None = auto-detect)
+    audio_mic2_index: Optional[int] = None  # Other person mic (None = same as mic1)
+    audio_isolation_enabled: bool = True
+    audio_isolation_input_index: Optional[int] = None
+    audio_isolation_output_index: Optional[int] = None
 
     # Computed from preset (set in __post_init__)
     processor_width: int = field(default=640, init=False)
@@ -129,14 +142,30 @@ def load_config(args: Optional[argparse.Namespace] = None) -> Config:
     if args is None:
         return Config()
 
+    audio_services = getattr(args, 'audio_services', None)
+    if audio_services:
+        audio_services_list = [s.strip() for s in audio_services.split(',') if s.strip()]
+    else:
+        audio_services_list = ["context"]
+
+    if getattr(args, 'voice_isolation', False) and "voice_isolation" not in audio_services_list:
+        audio_services_list.append("voice_isolation")
+
     return Config(
-        source=getattr(args, 'source', 'quest'),
+        source=getattr(args, 'source', 'quest_tcp'),
         processor=getattr(args, 'processor', 'yolo'),
         effect=getattr(args, 'effect', 'focus'),
         ui=getattr(args, 'ui', 'opencv'),
         preset=getattr(args, 'preset', ACTIVE_PRESET),
         auto_start=getattr(args, 'auto_start', True),
         headless=getattr(args, 'headless', False),
+        audio_enabled=not getattr(args, 'no_audio', False),
+        audio_services=audio_services_list,
+        audio_mic1_index=getattr(args, 'mic1', None),
+        audio_mic2_index=getattr(args, 'mic2', None),
+        audio_isolation_enabled=not getattr(args, 'no_voice_isolation', False),
+        audio_isolation_input_index=getattr(args, 'isolation_input', None),
+        audio_isolation_output_index=getattr(args, 'isolation_output', None),
     )
 
 
@@ -161,8 +190,8 @@ Examples:
     parser.add_argument(
         '--source', '-s',
         choices=['quest', 'quest_tcp', 'webcam', 'file'],
-        default='quest',
-        help='Video input source (default: quest). Use quest_tcp for Unity passthrough.'
+        default='quest_tcp',
+        help='Video input source (default: quest_tcp for Unity passthrough).'
     )
 
     parser.add_argument(
@@ -203,6 +232,66 @@ Examples:
         '--no-auto-start',
         action='store_true',
         help='Do not start processing automatically'
+    )
+
+    # Audio arguments
+    parser.add_argument(
+        '--no-audio',
+        action='store_true',
+        help='Disable audio processing'
+    )
+
+    parser.add_argument(
+        '--audio-services',
+        type=str,
+        default=None,
+        help='Comma-separated audio services to enable (e.g., context,voice_isolation)'
+    )
+
+    parser.add_argument(
+        '--voice-isolation',
+        action='store_true',
+        help='Enable voice isolation audio service'
+    )
+
+    parser.add_argument(
+        '--no-voice-isolation',
+        action='store_true',
+        help='Disable voice isolation processing (passthrough if service is enabled)'
+    )
+
+    parser.add_argument(
+        '--mic1',
+        type=int,
+        default=None,
+        help='Microphone index for user (None = default device)'
+    )
+
+    parser.add_argument(
+        '--mic2',
+        type=int,
+        default=None,
+        help='Microphone index for other person (None = same as mic1)'
+    )
+
+    parser.add_argument(
+        '--isolation-input',
+        type=int,
+        default=None,
+        help='Input device index for voice isolation (None = default)'
+    )
+
+    parser.add_argument(
+        '--isolation-output',
+        type=int,
+        default=None,
+        help='Output device index for voice isolation (None = default)'
+    )
+
+    parser.add_argument(
+        '--list-mics',
+        action='store_true',
+        help='List available microphones and exit'
     )
 
     return parser.parse_args()

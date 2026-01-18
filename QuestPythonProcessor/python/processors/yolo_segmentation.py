@@ -284,9 +284,9 @@ class YOLOSegmentationProcessor(BaseProcessor):
         left_small = cv2.resize(left_eye, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         right_small = cv2.resize(right_eye, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-        # Batch process both eyes
+        # Batch process both eyes (retina_masks=True gives masks at input resolution)
         batch = [left_small, right_small]
-        results = self.model(batch, verbose=False, classes=[0], device=self.device)
+        results = self.model(batch, verbose=False, classes=[0], device=self.device, retina_masks=True)
 
         # Extract results
         left_mask, left_center, left_box = self._extract_result(

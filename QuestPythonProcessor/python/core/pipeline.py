@@ -7,6 +7,8 @@ import signal
 import time
 from typing import Optional
 from collections import deque
+import cv2
+import numpy as np
 
 from .transition import TransitionEffect
 from sources.base import BaseSource
@@ -126,21 +128,65 @@ class Pipeline:
         print("-" * 40)
         print()
 
-        # Start source
+        headless = getattr(self.config, 'headless', False)
+
+        # Start source FIRST so we can show video quickly
         if not self.source.start():
             print("ERROR: Failed to start video source")
             return
 
-        # Start processor
-        self.processor.start()
-
-        # Setup UI
+        # Setup UI immediately so window appears
         self.ui.setup("Quest Processor (q=quit, p=toggle)")
 
-        # Start controls
-        pinch = QuestPinchControl(self._on_toggle)
-        pinch.start()
-        self.controls.append(pinch)
+        if not headless:
+            # Create a window immediately, even if the first camera frame is slow.
+            placeholder = np.zeros((360, 640, 3), dtype=np.uint8)
+            cv2.putText(
+                placeholder,
+                "Starting camera...",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            self.ui.show(placeholder, {'status': 'Starting camera...'})
+            cv2.waitKey(1)
+
+        # Show first frame immediately while model loads
+        first_frame = None
+        for _ in range(10):  # Try a few times to get first frame
+            first_frame = self.source.get_frame()
+            if first_frame is not None:
+                break
+            time.sleep(0.05)
+
+        if first_frame is not None:
+            # Show raw frame immediately
+            display = self.effect.no_effect(first_frame)
+            self.ui.show(display, {'status': 'Loading AI model...'})
+            cv2.waitKey(1)  # Force window to appear
+
+        # NOW load the processor (this is the slow part)
+        print("Loading AI model...")
+        self.processor.start()
+        print("Model loaded!")
+
+        # Initialize and start audio AFTER window and model are ready
+        self.audio_manager = None
+        if hasattr(self, 'audio_enabled') and self.audio_enabled and hasattr(self, 'AudioManagerClass'):
+            print("Initializing audio processing...")
+            self.audio_manager = self.AudioManagerClass(self.config)
+            self.audio_manager.start()
+            print("Audio processing started!")
+
+        # Start controls (only use Quest pinch control for Quest sources)
+        source_name = getattr(self.config, 'source', '')
+        if source_name.startswith('quest'):
+            pinch = QuestPinchControl(self._on_toggle)
+            pinch.start()
+            self.controls.append(pinch)
 
         # Auto-start processing if configured
         if getattr(self.config, 'auto_start', True):
@@ -159,11 +205,10 @@ class Pipeline:
         profile_interval = getattr(self.config, 'profile_interval', 30)
         process_skip = getattr(self.config, 'process_skip', 1)
         display_skip = getattr(self.config, 'display_skip', 1)
-        headless = getattr(self.config, 'headless', False)
-
         print()
         print("Press 'q' to quit, 'p' to toggle processing, 't' to toggle profiling")
-        print("Or PINCH your fingers on the Quest to toggle!")
+        if source_name.startswith('quest'):
+            print("Or PINCH your fingers on the Quest to toggle!")
         print()
 
         try:
@@ -206,8 +251,8 @@ class Pipeline:
                 else:
                     frame = self.effect.no_effect(frame_rgb)
 
-                # Render overlay panels onto frame (fixed position on left side)
-                frame = render_overlay(frame)
+                # Note: Overlay is now rendered in UI after scaling for crisp text
+                # frame = render_overlay(frame)
 
                 t_effect_end = time.time()
                 self.profiler.record('effect_apply', (t_effect_end - t_effect_start) * 1000)
@@ -230,11 +275,17 @@ class Pipeline:
                         status = "Idle"
                         effect_name = "None"
 
+                    # Check if person is being tracked (ProcessorResult has left_mask/right_mask)
+                    person_tracked = False
+                    if result is not None and result.has_detection:
+                        person_tracked = True
+
                     stats = {
                         'fps': fps,
                         'status': status,
                         'effect': effect_name,
                         'yolo_fps': self.processor.fps if hasattr(self.processor, 'fps') else 0,
+                        'person_tracked': person_tracked,
                     }
                     self.ui.show(frame, stats)
                 t_ui_end = time.time()

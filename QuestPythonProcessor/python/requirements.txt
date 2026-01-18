@@ -3,8 +3,20 @@ numpy>=1.24.0
 ultralytics>=8.0.0
 mysc>=3.2.0
 pywebview>=4.0.0
+Pillow>=10.0.0
+
+# Audio processing dependencies
+python-dotenv>=1.0.0
+pyaudio>=0.2.13
+webrtcvad>=2.0.10
+openai>=1.0.0
 
 # Note: For NVIDIA GPU support on Windows, install PyTorch with CUDA:
 # pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 #
 # For Mac, the default torch installation will use MPS (Metal).
+#
+# Note: PyAudio may require additional system dependencies:
+# - Windows: pip install pipwin && pipwin install pyaudio
+# - macOS: brew install portaudio && pip install pyaudio
+# - Linux: sudo apt-get install portaudio19-dev && pip install pyaudio

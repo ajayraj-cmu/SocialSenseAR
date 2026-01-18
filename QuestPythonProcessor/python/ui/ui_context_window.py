@@ -116,7 +116,8 @@ body {
     line-height: 1.4;
 
     /* Soft near-white, avoids harshness */
-    color: rgba(244, 250, 255, 0.96);
+    color: #fff !important;
+    opacity: 1;
 
     /* Gentle depth without heavy contrast */
     text-shadow: 0 1px 2px rgba(12, 20, 32, 0.35);
@@ -149,7 +150,8 @@ body {
     font-weight: 600;
     line-height: 1.4;
 
-    color: rgba(244, 250, 255, 0.96);
+    color: #fff !important;
+    opacity: 1;
     text-shadow: 0 1px 2px rgba(12, 20, 32, 0.30);
 
     display: -webkit-box;
@@ -184,7 +186,8 @@ body {
     line-height: 1.4;
     font-style: italic;
 
-    color: rgba(230, 240, 248, 0.92);
+    color: #fff !important;
+    opacity: 1;
 
     display: -webkit-box;
     -webkit-line-clamp: 2;

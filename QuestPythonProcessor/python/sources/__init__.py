@@ -12,14 +12,13 @@ from typing import Optional
 from .base import BaseSource
 from .quest_scrcpy import QuestSource
 from .quest_tcp import QuestTCPSource
+from .webcam import WebcamSource
 
 # Registry of available sources
 SOURCES = {
     "quest": QuestSource,
     "quest_tcp": QuestTCPSource,
-    # Add more sources here:
-    # "webcam": WebcamSource,
-    # "file": FileSource,
+    "webcam": WebcamSource,
 }
 
 

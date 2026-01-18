@@ -2,12 +2,14 @@
 OpenCV window UI backend.
 
 Simple UI using OpenCV's imshow for display.
+Renders overlay AFTER scaling for crisp text.
 """
 from typing import Optional
 import cv2
 import numpy as np
 
 from .base import BaseUI
+from .overlay_panels import render_overlay
 
 
 class OpenCVUI(BaseUI):
@@ -15,6 +17,7 @@ class OpenCVUI(BaseUI):
 
     Simple and portable UI that works on most platforms.
     Uses cv2.imshow() for display and cv2.waitKey() for input.
+    Renders overlay after scaling for crisp text.
     """
 
     def __init__(self, config=None):
@@ -26,6 +29,8 @@ class OpenCVUI(BaseUI):
         self.config = config
         self.window_name = "Quest Processor"
         self.max_width = 1920
+        self.render_overlay = True  # Render overlay in UI for crisp text
+        self._frame_count = 0  # Skip overlay for first few frames to show window quickly
         if config:
             self.max_width = getattr(config, 'display_max_width', 1920)
 
@@ -47,17 +52,30 @@ class OpenCVUI(BaseUI):
         """
         display_frame = frame
 
-        # Downscale if too wide
+        # Downscale if too wide (use INTER_AREA for quality)
         h, w = display_frame.shape[:2]
         if w > self.max_width:
             scale = self.max_width / w
             display_frame = cv2.resize(
                 display_frame, None,
                 fx=scale, fy=scale,
-                interpolation=cv2.INTER_NEAREST
+                interpolation=cv2.INTER_AREA
             )
 
+        # Show window first before any overlay processing
         cv2.imshow(self.window_name, display_frame)
+
+        # Render overlay AFTER window is shown (non-blocking for first frames)
+        if self.render_overlay and self._frame_count > 5:
+            try:
+                person_tracked = stats.get('person_tracked', True) if stats else True
+                display_frame = render_overlay(display_frame, person_tracked=person_tracked)
+                cv2.imshow(self.window_name, display_frame)
+            except Exception as e:
+                print(f"Overlay error: {e}")
+                self.render_overlay = False
+
+        self._frame_count += 1
 
     def poll_input(self) -> Optional[int]:
         """Poll for keyboard input.

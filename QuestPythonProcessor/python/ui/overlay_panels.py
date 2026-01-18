@@ -1,54 +1,66 @@
 #!/usr/bin/env python3
 """
-Overlay panels for context window and emotion display.
+Modern glassmorphism overlay panels with smooth animations.
 
-Renders glassmorphism-style panels directly onto the OpenCV frame
-on the left side, following head position with smoothing.
-Context on top, emotion on bottom.
+Features:
+- Only shows when a person is being tracked
+- Smooth fade + slide animations
+- Frosted glass effect with blur
+- Clean, modern design
 """
 import json
 import os
 import time
+import math
 from pathlib import Path
 from typing import Optional, Tuple
 import cv2
 import numpy as np
 
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
 
 class OverlayRenderer:
-    """Renders context and emotion panels directly onto frames."""
+    """Renders modern glassmorphism overlay panels with animations."""
 
     def __init__(self):
         # Panel config
-        self.panel_width = 280
-        self.margin = 20
-        self.panel_gap = 12
+        self.panel_width = 340
+        self.panel_gap = 14
         self.corner_radius = 16
+        self.padding_x = 24
+        self.padding_y = 20
 
-        # Colors (BGR format for OpenCV)
-        self.glass_bg = (196, 132, 86)  # Calm blue
-        self.glass_alpha = 0.25
-        self.border_color = (252, 220, 200)  # Light blue border
-        self.border_alpha = 0.72
-        self.text_color = (255, 250, 244)  # Near white
-        self.label_color = (244, 224, 208)  # Muted label
-        self.dim_text_color = (200, 200, 200)  # Dimmed text
+        # Animation settings
+        self.animation_duration = 0.4  # seconds
+        self._visible = False
+        self._animation_progress = 0.0  # 0 = hidden, 1 = visible
+        self._last_update = time.time()
+
+        # Glassmorphism colors
+        self.bg_color = (18, 18, 22)  # Near black
+        self.bg_alpha = 0.75
+        self.border_color = (255, 255, 255)  # White border
+        self.border_alpha = 0.12
+        self.blur_radius = 20
+
+        # Text colors (RGB for PIL)
+        self.white = (255, 255, 255)
+        self.label_color = (255, 255, 255, 140)  # Semi-transparent white
+        self.text_color = (255, 255, 255)
+        self.dim_color = (180, 180, 180)
 
         # Font settings
-        self.font = cv2.FONT_HERSHEY_SIMPLEX
-        self.label_scale = 0.35
-        self.text_scale = 0.45
-        self.emotion_scale = 0.6
+        self.label_size = 11
+        self.text_size = 18
+        self.emotion_size = 26
 
-        # Smoothing for position (higher = more responsive)
-        self._smooth_x = 0.5
-        self._smooth_y = 0.5
-        self._smooth_factor = 0.25  # Pretty responsive but still smooth
+        # Load fonts
+        self._font_label = self._load_font(self.label_size, bold=True)
+        self._font_text = self._load_font(self.text_size)
+        self._font_emotion = self._load_font(self.emotion_size, bold=True)
 
-        # Offset from person (panel appears to the left of them)
-        self.offset_from_person = 50  # pixels to the left of person
-
-        # State file path
+        # State file
         env_path = os.getenv("CONVO_STATE_PATH")
         if env_path:
             self.state_file = Path(env_path).expanduser()
@@ -64,10 +76,32 @@ class OverlayRenderer:
         # Cached state
         self._cached_state = None
         self._last_state_check = 0
-        self._state_check_interval = 0.3  # Check every 300ms
+        self._state_check_interval = 0.3
+
+    def _load_font(self, size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+        """Load a TrueType font with fallbacks."""
+        if bold:
+            font_names = ["segoeuib.ttf", "arialbd.ttf", "calibrib.ttf"]
+        else:
+            font_names = ["segoeui.ttf", "arial.ttf", "calibri.ttf"]
+
+        font_dirs = ["C:/Windows/Fonts/", "/usr/share/fonts/truetype/", "/System/Library/Fonts/"]
+
+        for font_dir in font_dirs:
+            for font_name in font_names:
+                font_path = os.path.join(font_dir, font_name)
+                if os.path.exists(font_path):
+                    try:
+                        return ImageFont.truetype(font_path, size)
+                    except:
+                        continue
+        try:
+            return ImageFont.truetype("arial.ttf", size)
+        except:
+            return ImageFont.load_default()
 
     def _load_state(self) -> dict:
-        """Load conversation state from file (with caching)."""
+        """Load conversation state from file."""
         now = time.time()
         if now - self._last_state_check < self._state_check_interval:
             return self._cached_state or {}
@@ -82,46 +116,101 @@ class OverlayRenderer:
             pass
         return self._cached_state or {}
 
-    def _draw_rounded_rect(self, frame: np.ndarray, x: int, y: int, w: int, h: int,
-                           bg_color: Tuple[int, int, int], bg_alpha: float,
-                           border_color: Tuple[int, int, int], border_alpha: float,
-                           radius: int = 16) -> None:
-        """Draw a rounded rectangle with transparency (glassmorphism effect)."""
-        # Create overlay for transparency
-        overlay = frame.copy()
+    def _ease_out_cubic(self, t: float) -> float:
+        """Smooth ease-out animation curve."""
+        return 1 - pow(1 - t, 3)
 
-        # Draw filled rounded rectangle
-        # Top-left corner
-        cv2.ellipse(overlay, (x + radius, y + radius), (radius, radius), 180, 0, 90, bg_color, -1)
-        # Top-right corner
-        cv2.ellipse(overlay, (x + w - radius, y + radius), (radius, radius), 270, 0, 90, bg_color, -1)
-        # Bottom-left corner
-        cv2.ellipse(overlay, (x + radius, y + h - radius), (radius, radius), 90, 0, 90, bg_color, -1)
-        # Bottom-right corner
-        cv2.ellipse(overlay, (x + w - radius, y + h - radius), (radius, radius), 0, 0, 90, bg_color, -1)
+    def _ease_in_cubic(self, t: float) -> float:
+        """Smooth ease-in animation curve."""
+        return t * t * t
 
-        # Fill rectangles
-        cv2.rectangle(overlay, (x + radius, y), (x + w - radius, y + h), bg_color, -1)
-        cv2.rectangle(overlay, (x, y + radius), (x + w, y + h - radius), bg_color, -1)
+    def _update_animation(self, should_show: bool) -> float:
+        """Update animation state and return current progress."""
+        now = time.time()
+        dt = now - self._last_update
+        self._last_update = now
 
-        # Blend with original
-        cv2.addWeighted(overlay, bg_alpha, frame, 1 - bg_alpha, 0, frame)
+        # Clamp dt to reasonable range (handles first frame after long delay)
+        dt = min(dt, 0.1)
 
-        # Draw border
+        # Animation speed
+        speed = 1.0 / self.animation_duration
+
+        if should_show:
+            self._animation_progress = min(1.0, self._animation_progress + dt * speed)
+            return self._ease_out_cubic(self._animation_progress)
+        else:
+            self._animation_progress = max(0.0, self._animation_progress - dt * speed)
+            return self._ease_out_cubic(self._animation_progress)
+
+    def _draw_glassmorphism_panel(self, frame: np.ndarray, x: int, y: int, w: int, h: int,
+                                   alpha: float = 1.0) -> np.ndarray:
+        """Draw a glassmorphism panel with blur effect."""
+        if alpha <= 0:
+            return frame
+
+        radius = self.corner_radius
+
+        # Create mask for rounded rectangle
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.rectangle(mask, (radius, 0), (w - radius, h), 255, -1)
+        cv2.rectangle(mask, (0, radius), (w, h - radius), 255, -1)
+        cv2.ellipse(mask, (radius, radius), (radius, radius), 180, 0, 90, 255, -1)
+        cv2.ellipse(mask, (w - radius, radius), (radius, radius), 270, 0, 90, 255, -1)
+        cv2.ellipse(mask, (radius, h - radius), (radius, radius), 90, 0, 90, 255, -1)
+        cv2.ellipse(mask, (w - radius, h - radius), (radius, radius), 0, 0, 90, 255, -1)
+
+        # Extract region and apply blur (frosted glass effect)
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(frame.shape[1], x + w), min(frame.shape[0], y + h)
+
+        if x2 <= x1 or y2 <= y1:
+            return frame
+
+        # Adjust mask to actual region size
+        mask_x1, mask_y1 = x1 - x, y1 - y
+        mask_x2, mask_y2 = mask_x1 + (x2 - x1), mask_y1 + (y2 - y1)
+        region_mask = mask[mask_y1:mask_y2, mask_x1:mask_x2]
+
+        # Get region and blur it
+        region = frame[y1:y2, x1:x2].copy()
+        blurred = cv2.GaussianBlur(region, (21, 21), 0)
+
+        # Create dark tinted overlay
+        dark_overlay = np.full_like(region, self.bg_color, dtype=np.uint8)
+
+        # Blend: blurred background + dark tint
+        blended = cv2.addWeighted(blurred, 0.3, dark_overlay, 0.7, 0)
+
+        # Apply with mask and alpha
+        mask_3ch = cv2.merge([region_mask, region_mask, region_mask]) / 255.0
+        mask_3ch = mask_3ch * (self.bg_alpha * alpha)
+
+        frame[y1:y2, x1:x2] = (blended * mask_3ch + region * (1 - mask_3ch)).astype(np.uint8)
+
+        # Draw subtle border
         border_overlay = frame.copy()
-        # Draw rounded border using arcs and lines
-        cv2.ellipse(border_overlay, (x + radius, y + radius), (radius, radius), 180, 0, 90, border_color, 2)
-        cv2.ellipse(border_overlay, (x + w - radius, y + radius), (radius, radius), 270, 0, 90, border_color, 2)
-        cv2.ellipse(border_overlay, (x + radius, y + h - radius), (radius, radius), 90, 0, 90, border_color, 2)
-        cv2.ellipse(border_overlay, (x + w - radius, y + h - radius), (radius, radius), 0, 0, 90, border_color, 2)
-        cv2.line(border_overlay, (x + radius, y), (x + w - radius, y), border_color, 2)
-        cv2.line(border_overlay, (x + radius, y + h), (x + w - radius, y + h), border_color, 2)
-        cv2.line(border_overlay, (x, y + radius), (x, y + h - radius), border_color, 2)
-        cv2.line(border_overlay, (x + w, y + radius), (x + w, y + h - radius), border_color, 2)
+        border_pts = []
 
-        cv2.addWeighted(border_overlay, border_alpha, frame, 1 - border_alpha, 0, frame)
+        # Top edge
+        cv2.line(border_overlay, (x + radius, y), (x + w - radius, y), self.border_color, 1)
+        # Bottom edge
+        cv2.line(border_overlay, (x + radius, y + h - 1), (x + w - radius, y + h - 1), self.border_color, 1)
+        # Left edge
+        cv2.line(border_overlay, (x, y + radius), (x, y + h - radius), self.border_color, 1)
+        # Right edge
+        cv2.line(border_overlay, (x + w - 1, y + radius), (x + w - 1, y + h - radius), self.border_color, 1)
+        # Corners
+        cv2.ellipse(border_overlay, (x + radius, y + radius), (radius, radius), 180, 0, 90, self.border_color, 1)
+        cv2.ellipse(border_overlay, (x + w - radius - 1, y + radius), (radius, radius), 270, 0, 90, self.border_color, 1)
+        cv2.ellipse(border_overlay, (x + radius, y + h - radius - 1), (radius, radius), 90, 0, 90, self.border_color, 1)
+        cv2.ellipse(border_overlay, (x + w - radius - 1, y + h - radius - 1), (radius, radius), 0, 0, 90, self.border_color, 1)
 
-    def _wrap_text(self, text: str, max_width: int, font_scale: float) -> list:
+        cv2.addWeighted(border_overlay, self.border_alpha * alpha, frame, 1 - self.border_alpha * alpha, 0, frame)
+
+        return frame
+
+    def _wrap_text(self, draw: ImageDraw.Draw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list:
         """Wrap text to fit within max_width."""
         words = text.split()
         lines = []
@@ -129,8 +218,8 @@ class OverlayRenderer:
 
         for word in words:
             test_line = current_line + " " + word if current_line else word
-            (w, _), _ = cv2.getTextSize(test_line, self.font, font_scale, 1)
-            if w <= max_width:
+            bbox = draw.textbbox((0, 0), test_line, font=font)
+            if bbox[2] - bbox[0] <= max_width:
                 current_line = test_line
             else:
                 if current_line:
@@ -142,118 +231,117 @@ class OverlayRenderer:
 
         return lines if lines else [""]
 
-    def _draw_text_with_shadow(self, frame: np.ndarray, text: str, pos: Tuple[int, int],
-                                font_scale: float, color: Tuple[int, int, int],
-                                thickness: int = 1) -> None:
-        """Draw text with subtle shadow for depth."""
-        x, y = pos
-        # Shadow
-        cv2.putText(frame, text, (x + 1, y + 1), self.font, font_scale, (30, 30, 30), thickness, cv2.LINE_AA)
-        # Main text
-        cv2.putText(frame, text, (x, y), self.font, font_scale, color, thickness, cv2.LINE_AA)
-
-    def render(self, frame: np.ndarray, head_x: float = 0.5, head_y: float = 0.5) -> np.ndarray:
-        """Render overlay panels onto frame.
-
-        Args:
-            frame: BGR frame to render onto
-            head_x: Normalized head X position (0-1)
-            head_y: Normalized head Y position (0-1)
-
-        Returns:
-            Frame with overlay rendered
-        """
+    def render(self, frame: np.ndarray, head_x: float = 0.5, head_y: float = 0.5,
+               person_tracked: bool = False) -> np.ndarray:
+        """Render overlay panels with animation."""
         h, w = frame.shape[:2]
-        half_w = w // 2  # For stereo, left eye is first half
 
-        # Smooth the head position
-        self._smooth_x += (head_x - self._smooth_x) * self._smooth_factor
-        self._smooth_y += (head_y - self._smooth_y) * self._smooth_factor
+        # Update animation
+        anim_progress = self._update_animation(person_tracked)
 
-        # Load current state
+        # Skip rendering if fully hidden
+        if anim_progress <= 0.01:
+            return frame
+
+        # Load state
         state = self._load_state()
-        convo_summary = state.get("convo_state_summary", "--")
+        convo_summary = state.get("convo_state_summary") or state.get("conversation_summary") or "Listening..."
         question = state.get("question", "")
-        utterance = state.get("recent_utterance", "--")
-        emotion = state.get("emotion") or state.get("emotion_label") or "Calm"
+        utterance = state.get("recent_utterance", "")
+        emotion = state.get("emotion") or state.get("emotion_label") or "Neutral"
 
-        # Calculate panel positions
-        # Context panel (top) - taller
-        context_height = 180
-        emotion_height = 70
+        # Calculate panel dimensions
+        line_height_text = 26
+        line_height_label = 20
+        section_spacing = 18
+
+        # Calculate context panel height dynamically
+        context_sections = 3  # conversation, question, just said
+        context_height = (self.padding_y * 2) + (context_sections * (line_height_label + line_height_text * 2)) + (section_spacing * 2)
+        emotion_height = self.padding_y * 2 + line_height_label + 36
 
         total_height = context_height + self.panel_gap + emotion_height
-        margin_top_bottom = 40
 
-        # Fixed X position - pinned to left side with margin for headset visibility
-        panel_x = 80  # Fixed distance from left edge
+        # Animated position (slide in from left)
+        base_x = 40
+        slide_offset = int((1 - anim_progress) * -80)  # Slide from -80px
+        panel_x = base_x + slide_offset
 
-        # Fixed Y position - vertically centered
         base_y = (h - total_height) // 2
 
-        # === CONTEXT PANEL ===
+        # Draw glassmorphism panels
         context_y = base_y
-        self._draw_rounded_rect(
-            frame, panel_x, context_y, self.panel_width, context_height,
-            self.glass_bg, self.glass_alpha,
-            self.border_color, self.border_alpha,
-            self.corner_radius
-        )
+        frame = self._draw_glassmorphism_panel(frame, panel_x, context_y,
+                                                self.panel_width, context_height, anim_progress)
 
-        # Conversation label
-        label_y = context_y + 22
-        self._draw_text_with_shadow(frame, "CONVERSATION", (panel_x + 12, label_y),
-                                    self.label_scale, self.label_color)
+        emotion_y = context_y + context_height + self.panel_gap
+        frame = self._draw_glassmorphism_panel(frame, panel_x, emotion_y,
+                                                self.panel_width, emotion_height, anim_progress)
 
-        # Conversation summary (wrapped)
-        text_y = label_y + 20
-        summary_lines = self._wrap_text(convo_summary, self.panel_width - 24, self.text_scale)
-        for i, line in enumerate(summary_lines[:2]):  # Max 2 lines
-            self._draw_text_with_shadow(frame, line, (panel_x + 12, text_y + i * 18),
-                                        self.text_scale, self.text_color)
+        # Render text with PIL
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(frame_rgb)
+        draw = ImageDraw.Draw(pil_image)
 
-        # Question section
-        question_y = context_y + 70
-        self._draw_text_with_shadow(frame, "QUESTION", (panel_x + 12, question_y),
-                                    self.label_scale, self.label_color)
+        # Text alpha based on animation
+        text_alpha = int(255 * anim_progress)
+        white_a = (255, 255, 255, text_alpha)
+        label_a = (160, 160, 160, text_alpha)
+        dim_a = (140, 140, 140, text_alpha)
+
+        text_x = panel_x + self.padding_x
+        max_text_width = self.panel_width - (self.padding_x * 2)
+
+        # === CONTEXT PANEL ===
+        y = context_y + self.padding_y
+
+        # CONVERSATION
+        draw.text((text_x, y), "CONVERSATION", font=self._font_label, fill=label_a)
+        y += line_height_label
+
+        summary_lines = self._wrap_text(draw, convo_summary, self._font_text, max_text_width)
+        for line in summary_lines[:2]:
+            draw.text((text_x, y), line, font=self._font_text, fill=white_a)
+            y += line_height_text
+        y += section_spacing
+
+        # QUESTION
+        draw.text((text_x, y), "QUESTION", font=self._font_label, fill=label_a)
+        y += line_height_label
+
         q_text = question if question else "No question detected"
-        q_color = self.text_color if question else self.dim_text_color
-        q_lines = self._wrap_text(q_text, self.panel_width - 24, self.text_scale)
-        for i, line in enumerate(q_lines[:2]):
-            self._draw_text_with_shadow(frame, line, (panel_x + 12, question_y + 18 + i * 18),
-                                        self.text_scale, q_color)
+        q_fill = white_a if question else dim_a
+        q_lines = self._wrap_text(draw, q_text, self._font_text, max_text_width)
+        for line in q_lines[:2]:
+            draw.text((text_x, y), line, font=self._font_text, fill=q_fill)
+            y += line_height_text
+        y += section_spacing
 
-        # Utterance section
-        utterance_y = context_y + 130
-        self._draw_text_with_shadow(frame, "JUST SAID", (panel_x + 12, utterance_y),
-                                    self.label_scale, self.label_color)
-        utt_text = f'"{utterance}"' if utterance != "--" else "--"
-        utt_lines = self._wrap_text(utt_text, self.panel_width - 24, self.text_scale * 0.9)
-        for i, line in enumerate(utt_lines[:2]):
-            self._draw_text_with_shadow(frame, line, (panel_x + 12, utterance_y + 18 + i * 16),
-                                        self.text_scale * 0.9, self.dim_text_color)
+        # JUST SAID
+        draw.text((text_x, y), "JUST SAID", font=self._font_label, fill=label_a)
+        y += line_height_label
+
+        utt_text = f'"{utterance}"' if utterance else "..."
+        utt_lines = self._wrap_text(draw, utt_text, self._font_text, max_text_width)
+        for line in utt_lines[:2]:
+            draw.text((text_x, y), line, font=self._font_text, fill=white_a)
+            y += line_height_text
 
         # === EMOTION PANEL ===
-        emotion_y = context_y + context_height + self.panel_gap
-        self._draw_rounded_rect(
-            frame, panel_x, emotion_y, self.panel_width, emotion_height,
-            self.glass_bg, self.glass_alpha,
-            self.border_color, self.border_alpha,
-            self.corner_radius
-        )
+        y = emotion_y + self.padding_y
 
-        # Emotion label
-        self._draw_text_with_shadow(frame, "EMOTION", (panel_x + 12, emotion_y + 22),
-                                    self.label_scale, self.label_color)
+        draw.text((text_x, y), "EMOTION", font=self._font_label, fill=label_a)
+        y += line_height_label + 4
 
-        # Emotion text (larger)
-        self._draw_text_with_shadow(frame, emotion, (panel_x + 12, emotion_y + 50),
-                                    self.emotion_scale, self.text_color, thickness=2)
+        draw.text((text_x, y), emotion, font=self._font_emotion, fill=white_a)
+
+        # Convert back to BGR
+        frame = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
         return frame
 
 
-# Global renderer instance
+# Global renderer
 _renderer: Optional[OverlayRenderer] = None
 
 
@@ -265,32 +353,23 @@ def get_renderer() -> OverlayRenderer:
     return _renderer
 
 
-def render_overlay(frame: np.ndarray, head_x: float = 0.5, head_y: float = 0.5) -> np.ndarray:
-    """Render overlay panels onto frame.
-
-    Args:
-        frame: BGR frame to render onto
-        head_x: Normalized head X position (0-1)
-        head_y: Normalized head Y position (0-1)
-
-    Returns:
-        Frame with overlay rendered
-    """
+def render_overlay(frame: np.ndarray, head_x: float = 0.5, head_y: float = 0.5,
+                   person_tracked: bool = False) -> np.ndarray:
+    """Render overlay panels onto frame."""
     renderer = get_renderer()
-    return renderer.render(frame, head_x, head_y)
+    return renderer.render(frame, head_x, head_y, person_tracked)
 
 
-# Keep these for backwards compatibility but they're no-ops now
 def start_overlay():
-    """No-op - overlay is now rendered directly onto frames."""
+    """No-op for backwards compatibility."""
     pass
 
 
 def stop_overlay():
-    """No-op - overlay is now rendered directly onto frames."""
+    """No-op for backwards compatibility."""
     pass
 
 
 def update_head_position(head_y: float):
-    """No-op - head position is passed directly to render_overlay."""
+    """No-op for backwards compatibility."""
     pass

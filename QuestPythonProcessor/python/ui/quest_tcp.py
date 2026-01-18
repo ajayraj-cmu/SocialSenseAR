@@ -27,7 +27,7 @@ class QuestTCPUI(BaseUI):
         self.config = config
         self.source = None  # Set by pipeline or config
         self.window_name = "Quest Preview"
-        self.jpeg_quality = getattr(config, 'jpeg_quality', 85) if config else 85
+        self.jpeg_quality = getattr(config, 'jpeg_quality', 92) if config else 92
         self.show_preview = getattr(config, 'show_preview', True) if config else True
 
         # Stats

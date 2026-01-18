@@ -184,7 +184,7 @@ body {
     line-height: 1.4;
     font-style: italic;
 
-    color: rgba(230, 240, 248, 0.92);
+    color: rgba(244, 250, 255, 0.96);
 
     display: -webkit-box;
     -webkit-line-clamp: 2;

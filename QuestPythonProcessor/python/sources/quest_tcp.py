@@ -230,26 +230,33 @@ class QuestTCPSource(BaseSource):
         """Receive frames from connected client."""
         frame_count = 0
         last_profile_time = time.time()
-        recv_times = []
+        wait_times = []  # Time waiting for Unity to send
+        transfer_times = []  # Actual network transfer time
         decode_times = []
         raw_mode_logged = False
 
         while self.running and self.connected:
             t0 = time.time()
 
-            # Receive frame size (4 bytes)
+            # Receive frame size (4 bytes) - this includes wait time
             size_data = self._recv_all(4)
             if not size_data:
                 raise ConnectionError("Client disconnected")
 
+            t_header = time.time()  # Header received, frame transfer starting
+
             frame_size = struct.unpack('<I', size_data)[0]
 
-            # Receive frame data
+            # Receive frame data - this is actual transfer time
             frame_data = self._recv_all(frame_size)
             if not frame_data:
                 raise ConnectionError("Failed to receive frame")
 
             t1 = time.time()
+
+            # Separate wait time vs transfer time
+            wait_ms = (t_header - t0) * 1000  # Waiting for Unity
+            transfer_ms = (t1 - t_header) * 1000  # Actual network transfer
 
             # Check frame type (first byte)
             frame_type = frame_data[0]
@@ -337,28 +344,34 @@ class QuestTCPSource(BaseSource):
 
             # Profile
             if PROFILE:
-                recv_ms = (t1 - t0) * 1000
                 decode_ms = (t2 - t1) * 1000
-                recv_times.append(recv_ms)
+                wait_times.append(wait_ms)
+                transfer_times.append(transfer_ms)
                 decode_times.append(decode_ms)
                 frame_count += 1
 
                 if time.time() - last_profile_time >= 2.0:
-                    avg_recv = sum(recv_times) / len(recv_times) if recv_times else 0
+                    avg_wait = sum(wait_times) / len(wait_times) if wait_times else 0
+                    avg_transfer = sum(transfer_times) / len(transfer_times) if transfer_times else 0
                     avg_decode = sum(decode_times) / len(decode_times) if decode_times else 0
                     fps = frame_count / (time.time() - last_profile_time)
                     mode = {0x00: "JPEG", 0x01: "RAW24", 0x02: "LZ4", 0x03: "RGB565", 0x04: "RGBA32"}.get(frame_type, "???")
-                    bandwidth_mbps = (frame_size * fps * 8) / (1024 * 1024)
+
+                    # Calculate actual transfer bandwidth (excluding wait time)
+                    actual_bandwidth_mbps = (frame_size / (avg_transfer / 1000)) * 8 / (1024 * 1024) if avg_transfer > 0 else 0
 
                     # Identify bottleneck
                     bottleneck = ""
-                    if avg_recv > avg_decode and avg_recv > 10:
-                        bottleneck = " << USB TRANSFER BOTTLENECK"
-                    elif avg_decode > avg_recv and avg_decode > 10:
-                        bottleneck = " << DECODE BOTTLENECK"
+                    if avg_wait > avg_transfer and avg_wait > 20:
+                        bottleneck = " << UNITY FRAME PRODUCTION SLOW"
+                    elif avg_transfer > 20:
+                        bottleneck = " << USB TRANSFER SLOW"
+                    elif avg_decode > 20:
+                        bottleneck = " << DECODE SLOW"
 
-                    print(f"\n[TCP-IN] {mode} recv:{avg_recv:.1f}ms decode:{avg_decode:.1f}ms | {fps:.1f}fps | {frame_size//1024}KB | {bandwidth_mbps:.0f}Mbps{bottleneck}")
-                    recv_times.clear()
+                    print(f"\n[TCP-IN] {mode} wait:{avg_wait:.1f}ms transfer:{avg_transfer:.1f}ms decode:{avg_decode:.1f}ms | {fps:.1f}fps | {frame_size//1024}KB | {actual_bandwidth_mbps:.0f}Mbps actual{bottleneck}")
+                    wait_times.clear()
+                    transfer_times.clear()
                     decode_times.clear()
                     frame_count = 0
                     last_profile_time = time.time()

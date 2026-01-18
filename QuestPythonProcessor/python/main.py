@@ -29,18 +29,39 @@ Architecture:
     ├── controls/           # Input controls
     └── ui/                 # Display backends
 """
+from pathlib import Path
+from dotenv import load_dotenv
+
 from config import Config, parse_args, load_config
 from core.pipeline import Pipeline
 from sources import get_source
 from processors import get_processor
 from effects import get_effect
 from ui import get_ui
+from audio import AudioManager
 
 
 def main():
     """Main entry point."""
+    # Load environment variables from .env file
+    # Look in the project root (parent of python directory)
+    project_root = Path(__file__).resolve().parent.parent.parent
+    env_file = project_root / ".env"
+    if env_file.exists():
+        load_dotenv(env_file)
+        print(f"[CONFIG] Loaded environment from {env_file}")
+    else:
+        # Try current directory as fallback
+        load_dotenv()
+
     # Parse command-line arguments
     args = parse_args()
+
+    # Handle --list-mics: show available microphones and exit
+    if getattr(args, 'list_mics', False):
+        audio_manager = AudioManager.__new__(AudioManager)
+        audio_manager.list_microphones()
+        return
 
     # Load configuration
     config = load_config(args)
@@ -58,9 +79,9 @@ def main():
     if args.no_auto_start:
         config.auto_start = False
 
-    # Note: Overlay panels (context/emotion) are now integrated directly
-    # into the UI backends (OpenCVUI, QuestTCPUI) and launched automatically.
-    # The separate test_webview.py helper is no longer needed.
+    # Defer audio manager creation - will be initialized after window appears
+    audio_manager = None
+    audio_enabled = config.audio_enabled
 
     # Initialize components
     print(f"Initializing with preset: {config.preset}")
@@ -68,6 +89,7 @@ def main():
     print(f"  Processor: {config.processor}")
     print(f"  Effect: {config.effect}")
     print(f"  UI: {config.ui}")
+    print(f"  Audio: {'enabled' if config.audio_enabled else 'disabled'}")
     print()
 
     source = get_source(config.source, config)
@@ -75,9 +97,20 @@ def main():
     effect = get_effect(config.effect, config)
     ui = get_ui(config.ui, config)
 
-    # Create and run pipeline
+    # Create pipeline
     pipeline = Pipeline(source, processor, effect, ui, config)
-    pipeline.run()
+
+    # Pass audio config to pipeline - it will create and start AudioManager after window appears
+    pipeline.audio_enabled = audio_enabled
+    pipeline.AudioManagerClass = AudioManager if audio_enabled else None
+
+    try:
+        # Run video pipeline (audio starts inside after window appears)
+        pipeline.run()
+    finally:
+        # Cleanup audio
+        if hasattr(pipeline, 'audio_manager') and pipeline.audio_manager:
+            pipeline.audio_manager.stop()
 
 
 if __name__ == "__main__":

@@ -99,7 +99,8 @@ CONVO_HELPER_HTML = """
         .main-topic {
             font-size: 15px;
             font-weight: 600;
-            color: rgba(255, 255, 255, 0.95);
+            color: #fff !important;
+            opacity: 1;
             line-height: 1.2;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -111,7 +112,8 @@ CONVO_HELPER_HTML = """
         /* Sub context */
         .sub-context {
             font-size: 12px;
-            color: rgba(255, 255, 255, 0.7);
+            color: #fff !important;
+            opacity: 1;
             line-height: 1.3;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -150,7 +152,8 @@ CONVO_HELPER_HTML = """
         .question-text {
             font-size: 13px;
             font-weight: 500;
-            color: #e0e7ff;
+            color: #fff !important;
+            opacity: 1;
             line-height: 1.3;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -176,7 +179,8 @@ CONVO_HELPER_HTML = """
 
         .utterance-text {
             font-size: 11px;
-            color: rgba(255, 255, 255, 0.6);
+            color: #fff !important;
+            opacity: 1;
             line-height: 1.35;
             font-style: italic;
             overflow: hidden;
