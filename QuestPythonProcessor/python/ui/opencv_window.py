@@ -69,7 +69,10 @@ class OpenCVUI(BaseUI):
         if self.render_overlay and self._frame_count > 5:
             try:
                 person_tracked = stats.get('person_tracked', True) if stats else True
-                display_frame = render_overlay(display_frame, person_tracked=person_tracked)
+                head_x = stats.get('head_x', 0.5) if stats else 0.5
+                head_y = stats.get('head_y', 0.3) if stats else 0.3
+                display_frame = render_overlay(display_frame, head_x=head_x, head_y=head_y,
+                                               person_tracked=person_tracked)
                 cv2.imshow(self.window_name, display_frame)
             except Exception as e:
                 print(f"Overlay error: {e}")

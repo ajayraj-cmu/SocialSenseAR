@@ -277,8 +277,57 @@ class Pipeline:
 
                     # Check if person is being tracked (ProcessorResult has left_mask/right_mask)
                     person_tracked = False
+                    head_x, head_y = 0.5, 0.3  # Default head position
                     if result is not None and result.has_detection:
                         person_tracked = True
+                        h, w = frame.shape[:2]
+
+                        # Use left_center (normalized 0-1) for head position
+                        # In stereo mode, left_center is relative to left half
+                        head_x = result.left_center[0]
+                        head_y = max(0.1, result.left_center[1] - 0.15)  # Above center
+
+                        # Extract region for emotion detection - pass whole person bbox
+                        # and let fer's MTCNN find the actual face
+                        if self.audio_manager is not None:
+                            try:
+                                # Check for stereo mode
+                                aspect = w / h
+                                is_stereo = aspect > 2.0
+                                eye_w = w // 2 if is_stereo else w
+
+                                # Get the full person bounding box
+                                if result.left_box is not None:
+                                    # Box is normalized 0-1, convert to pixels
+                                    bx1 = int(result.left_box[0] * eye_w)
+                                    by1 = int(result.left_box[1] * h)
+                                    bx2 = int(result.left_box[2] * eye_w)
+                                    by2 = int(result.left_box[3] * h)
+
+                                    # Add some padding and pass the FULL person region
+                                    # fer's MTCNN will find the face within this region
+                                    pad = int((bx2 - bx1) * 0.1)
+                                    x1 = max(0, bx1 - pad)
+                                    y1 = max(0, by1)
+                                    x2 = min(eye_w, bx2 + pad)
+                                    y2 = min(h, by2)
+                                else:
+                                    # Fallback: use large center region
+                                    cx = int(result.left_center[0] * eye_w)
+                                    cy = int(result.left_center[1] * h)
+                                    region_w = int(eye_w * 0.5)
+                                    region_h = int(h * 0.7)
+                                    x1 = max(0, cx - region_w // 2)
+                                    y1 = max(0, cy - region_h // 2)
+                                    x2 = min(eye_w, cx + region_w // 2)
+                                    y2 = min(h, cy + region_h // 2)
+
+                                if x2 > x1 + 50 and y2 > y1 + 50:
+                                    # Extract from left eye region only
+                                    face_bgr = cv2.cvtColor(frame_rgb[y1:y2, x1:x2], cv2.COLOR_RGB2BGR)
+                                    self.audio_manager.submit_face(face_bgr, (x1, y1, x2-x1, y2-y1))
+                            except Exception as e:
+                                pass  # Don't let face extraction errors break the pipeline
 
                     stats = {
                         'fps': fps,
@@ -286,6 +335,8 @@ class Pipeline:
                         'effect': effect_name,
                         'yolo_fps': self.processor.fps if hasattr(self.processor, 'fps') else 0,
                         'person_tracked': person_tracked,
+                        'head_x': head_x,
+                        'head_y': head_y,
                     }
                     self.ui.show(frame, stats)
                 t_ui_end = time.time()

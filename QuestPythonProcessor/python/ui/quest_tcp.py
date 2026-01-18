@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 
 from .base import BaseUI
+from .overlay_panels import render_overlay
 
 # Profiling
 PROFILE = True
@@ -27,8 +28,10 @@ class QuestTCPUI(BaseUI):
         self.config = config
         self.source = None  # Set by pipeline or config
         self.window_name = "Quest Preview"
-        self.jpeg_quality = getattr(config, 'jpeg_quality', 92) if config else 92
+        self.jpeg_quality = getattr(config, 'jpeg_quality', 95) if config else 95
         self.show_preview = getattr(config, 'show_preview', True) if config else True
+        # Raw mode: send uncompressed RGB24 instead of JPEG (faster encode, larger transfer)
+        self.use_raw = getattr(config, 'use_raw_output', False) if config else False
 
         # Stats
         self.frames_sent = 0
@@ -60,11 +63,18 @@ class QuestTCPUI(BaseUI):
         # Don't convert - effect.apply() returns BGR
         frame_bgr = frame
 
+        # Render overlay panels onto frame before sending to Quest
+        if stats:
+            head_x = stats.get('head_x', 0.5)
+            head_y = stats.get('head_y', 0.3)
+            person_tracked = stats.get('person_tracked', False)
+            frame_bgr = render_overlay(frame_bgr, head_x, head_y, person_tracked)
+
         t0 = time.time()
 
         # Send to Quest
         if self.source and hasattr(self.source, 'send_processed_frame'):
-            success = self.source.send_processed_frame(frame_bgr, self.jpeg_quality)
+            success = self.source.send_processed_frame(frame_bgr, self.jpeg_quality, use_raw=self.use_raw)
             if success:
                 self.frames_sent += 1
             elif self.frames_sent == 0:

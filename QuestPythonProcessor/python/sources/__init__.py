@@ -13,12 +13,14 @@ from .base import BaseSource
 from .quest_scrcpy import QuestSource
 from .quest_tcp import QuestTCPSource
 from .webcam import WebcamSource
+from .video_file import VideoFileSource
 
 # Registry of available sources
 SOURCES = {
     "quest": QuestSource,
     "quest_tcp": QuestTCPSource,
     "webcam": WebcamSource,
+    "file": VideoFileSource,
 }
 
 

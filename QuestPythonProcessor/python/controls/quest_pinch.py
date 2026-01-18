@@ -67,11 +67,17 @@ class QuestPinchControl(BaseControl):
         try:
             import adbutils
             adb_path = adbutils.adb_path()
+            print(f"[PINCH] Using ADB at: {adb_path}")
+
+            # Check if Quest is connected
+            result = subprocess.run([adb_path, 'devices'], capture_output=True, text=True, timeout=5)
+            print(f"[PINCH] ADB devices:\n{result.stdout}")
 
             # Clear logcat buffer first
             subprocess.run([adb_path, 'logcat', '-c'], capture_output=True, timeout=2)
 
             # Start monitoring logcat for hand tracking events
+            print("[PINCH] Starting hand tracking monitor...")
             process = subprocess.Popen(
                 [adb_path, 'logcat', '-v', 'time', 'TrexHandInputDataServerPlugin:I', '*:S'],
                 stdout=subprocess.PIPE,

@@ -100,17 +100,24 @@ class Config:
     transition_duration: float = 1.0
 
     # TCP streaming quality (0-100, higher = better quality but larger size)
-    jpeg_quality: int = 92
+    jpeg_quality: int = 95
+    # Raw output mode: send uncompressed RGB24 instead of JPEG (faster encode, larger transfer)
+    use_raw_output: bool = False
 
     # Audio processing
     audio_enabled: bool = True
-    audio_services: List[str] = field(default_factory=lambda: ["context"])
+    audio_services: List[str] = field(default_factory=lambda: ["context", "emotion"])
     audio_state_dir: str = "~/Downloads/Nex/conve_context"
     audio_mic1_index: Optional[int] = None  # User mic (None = auto-detect)
     audio_mic2_index: Optional[int] = None  # Other person mic (None = same as mic1)
     audio_isolation_enabled: bool = True
     audio_isolation_input_index: Optional[int] = None
     audio_isolation_output_index: Optional[int] = None
+
+    # Video file source
+    video_file: Optional[str] = None
+    playback_speed: float = 1.0
+    loop_video: bool = False
 
     # Computed from preset (set in __post_init__)
     processor_width: int = field(default=640, init=False)
@@ -146,7 +153,7 @@ def load_config(args: Optional[argparse.Namespace] = None) -> Config:
     if audio_services:
         audio_services_list = [s.strip() for s in audio_services.split(',') if s.strip()]
     else:
-        audio_services_list = ["context"]
+        audio_services_list = ["context", "emotion"]
 
     if getattr(args, 'voice_isolation', False) and "voice_isolation" not in audio_services_list:
         audio_services_list.append("voice_isolation")
@@ -159,6 +166,7 @@ def load_config(args: Optional[argparse.Namespace] = None) -> Config:
         preset=getattr(args, 'preset', ACTIVE_PRESET),
         auto_start=getattr(args, 'auto_start', True),
         headless=getattr(args, 'headless', False),
+        use_raw_output=getattr(args, 'raw_output', False),
         audio_enabled=not getattr(args, 'no_audio', False),
         audio_services=audio_services_list,
         audio_mic1_index=getattr(args, 'mic1', None),
@@ -166,6 +174,9 @@ def load_config(args: Optional[argparse.Namespace] = None) -> Config:
         audio_isolation_enabled=not getattr(args, 'no_voice_isolation', False),
         audio_isolation_input_index=getattr(args, 'isolation_input', None),
         audio_isolation_output_index=getattr(args, 'isolation_output', None),
+        video_file=getattr(args, 'video_file', None),
+        playback_speed=getattr(args, 'playback_speed', 1.0),
+        loop_video=getattr(args, 'loop', False),
     )
 
 
@@ -226,6 +237,12 @@ Examples:
         '--headless',
         action='store_true',
         help='Run without display window'
+    )
+
+    parser.add_argument(
+        '--raw-output',
+        action='store_true',
+        help='Send raw RGB24 pixels instead of JPEG (faster encode, larger transfer)'
     )
 
     parser.add_argument(
@@ -292,6 +309,27 @@ Examples:
         '--list-mics',
         action='store_true',
         help='List available microphones and exit'
+    )
+
+    # Video file arguments
+    parser.add_argument(
+        '--video-file', '-f',
+        type=str,
+        default=None,
+        help='Path to video file (use with --source file)'
+    )
+
+    parser.add_argument(
+        '--playback-speed',
+        type=float,
+        default=1.0,
+        help='Video playback speed multiplier (default: 1.0)'
+    )
+
+    parser.add_argument(
+        '--loop',
+        action='store_true',
+        help='Loop video playback'
     )
 
     return parser.parse_args()

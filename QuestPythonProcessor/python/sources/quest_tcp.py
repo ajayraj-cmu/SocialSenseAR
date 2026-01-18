@@ -130,11 +130,18 @@ class QuestTCPSource(BaseSource):
             "port": self.port,
         }
 
-    def send_processed_frame(self, frame: np.ndarray, quality: int = 85) -> bool:
+    def send_processed_frame(self, frame: np.ndarray, quality: int = 85, use_raw: bool = False) -> bool:
         """Send processed frame back to Quest.
 
         This is called by QuestTCPUI to send results back.
-        Returns tuple of (success, encode_time_ms, send_time_ms) for profiling.
+
+        Args:
+            frame: BGR frame to send
+            quality: JPEG quality (1-100), ignored if use_raw=True
+            use_raw: If True, send raw RGB24 pixels instead of JPEG (faster encode, larger transfer)
+
+        Returns:
+            True if successful
         """
         if not self.connected:
             print(f"[TCP-OUT] Cannot send: not connected")
@@ -146,12 +153,24 @@ class QuestTCPSource(BaseSource):
         try:
             t0 = time.time()
 
-            # Encode as JPEG
-            _, encoded = cv2.imencode(
-                '.jpg', frame,
-                [cv2.IMWRITE_JPEG_QUALITY, quality]
-            )
-            data = encoded.tobytes()
+            if use_raw:
+                # Send raw BGR pixels directly (skip BGR→RGB conversion, Unity will swap)
+                # This saves ~7ms per frame vs converting to RGB
+                # Flip vertically for Unity (OpenCV origin top-left, Unity texture bottom-left)
+                frame_flipped = np.flipud(frame)
+                h, w = frame_flipped.shape[:2]
+
+                # Header: [4-byte magic 'BGR\0'][4-byte width][4-byte height][pixels]
+                # Using 'BGR\0' magic tells Unity to swap R/B channels
+                header = struct.pack('<4sII', b'BGR\x00', w, h)
+                data = header + frame_flipped.tobytes()
+            else:
+                # Encode as JPEG
+                _, encoded = cv2.imencode(
+                    '.jpg', frame,
+                    [cv2.IMWRITE_JPEG_QUALITY, quality]
+                )
+                data = encoded.tobytes()
 
             t1 = time.time()
 
@@ -331,8 +350,10 @@ class QuestTCPSource(BaseSource):
             t2 = time.time()
 
             if frame_rgb is not None:
-                # Flip vertically - Unity sends upside down relative to OpenCV
-                frame_rgb = np.flipud(frame_rgb).copy()
+                # Only flip JPEG frames - RAW frames from Unity are already correctly oriented
+                # (JPEG encoder does an implicit flip that RAW doesn't)
+                if frame_type == 0x00:  # JPEG only
+                    frame_rgb = np.flipud(frame_rgb).copy()
 
                 with self.lock:
                     self.latest_frame = frame_rgb

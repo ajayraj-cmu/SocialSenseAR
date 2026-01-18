@@ -4,6 +4,12 @@ Context Service - Dual-mic audio capture, VAD, transcription, and summarization.
 Adapted from Audio_Merge/context_window.py for integration with QuestPythonProcessor.
 Captures audio from two microphones, transcribes speech using OpenAI Whisper,
 and generates conversation summaries using GPT-4o-mini.
+
+Features:
+- Immediate "just said" updates (no waiting for LLM)
+- Social cue detection
+- Speaking state tracking
+- Emotion-aware summarization
 """
 import pyaudio
 import webrtcvad
@@ -19,6 +25,7 @@ from typing import Dict, Any, Optional, List
 from openai import OpenAI
 
 from .base import BaseAudioService
+from .social_cue_detector import detect_social_cues, SocialCue
 
 
 class ContextService(BaseAudioService):
@@ -59,6 +66,10 @@ class ContextService(BaseAudioService):
         self.audio_queue_user: Optional[Queue] = None
         self.audio_queue_other: Optional[Queue] = None
 
+        # Raw frame queues for callback-based capture (more reliable with Intel mics)
+        self._raw_frame_queue_user: Optional[Queue] = None
+        self._raw_frame_queue_other: Optional[Queue] = None
+
         # Processing threads
         self.threads: List[threading.Thread] = []
 
@@ -69,14 +80,29 @@ class ContextService(BaseAudioService):
         # Single mic mode flag
         self.single_mic_mode = False
 
-        # Current state
+        # Current state - expanded for conversation helper
         self.current_state: Dict[str, Any] = {
             "convo_state_summary": "--",
             "question": "",
             "recent_utterance": "--",
-            "emotion": "Calm",
+            "emotion": "Neutral",
+            "emotion_display": "Neutral",
+            "is_other_speaking": False,
+            "is_user_speaking": False,
+            "social_cue": None,  # Current active social cue
+            "social_cue_icon": None,
+            "social_cue_timestamp": 0,
+            "vibe": "neutral",  # engaged, bored, upset, etc.
             "timestamp": ""
         }
+
+        # External emotion input (from EmotionService)
+        self._external_emotion: Optional[str] = None
+        self._emotion_lock = threading.Lock()
+
+        # Social cue cooldown (don't spam)
+        self._last_social_cue_time = 0
+        self.SOCIAL_CUE_COOLDOWN = 4.0  # seconds between cues
 
     def start(self) -> bool:
         """Start audio capture with configured microphones.
@@ -89,6 +115,24 @@ class ContextService(BaseAudioService):
             self.state_dir.mkdir(parents=True, exist_ok=True)
             self.user_dir.mkdir(exist_ok=True)
             self.other_dir.mkdir(exist_ok=True)
+
+            # Reset state on startup
+            self.current_state = {
+                "convo_state_summary": "Listening...",
+                "question": "",
+                "recent_utterance": "",
+                "emotion": "Neutral",
+                "emotion_display": "Neutral",
+                "is_other_speaking": False,
+                "is_user_speaking": False,
+                "social_cue": None,
+                "social_cue_icon": None,
+                "social_cue_timestamp": 0,
+                "vibe": "neutral",
+                "timestamp": ""
+            }
+            # Write fresh state to file
+            self.write_state(self.current_state)
 
             # Initialize PyAudio
             self.pyaudio = pyaudio.PyAudio()
@@ -120,6 +164,10 @@ class ContextService(BaseAudioService):
             self.audio_queue_user = Queue()
             self.audio_queue_other = Queue()
 
+            # Setup raw frame queues for callback-based capture
+            self._raw_frame_queue_user = Queue(maxsize=100)
+            self._raw_frame_queue_other = Queue(maxsize=100)
+
             # Set running BEFORE starting any threads!
             self.running = True
 
@@ -139,21 +187,32 @@ class ContextService(BaseAudioService):
                 # Setup VAD
                 vad = webrtcvad.Vad(self.VAD_AGGRESSIVENESS)
 
-                # Open single audio stream
+                # Create callback for audio capture (more reliable with Intel mics)
+                def audio_callback_other(in_data, frame_count, time_info, status):
+                    if self.running:
+                        try:
+                            self._raw_frame_queue_other.put_nowait(in_data)
+                        except:
+                            pass  # Queue full, drop frame
+                    return (None, pyaudio.paContinue)
+
+                # Open single audio stream with callback
                 stream = self.pyaudio.open(
                     format=pyaudio.paInt16,
                     channels=1,
                     rate=self.SAMPLE_RATE,
                     input=True,
                     input_device_index=mic1_index,
-                    frames_per_buffer=self.FRAME_SIZE
+                    frames_per_buffer=self.FRAME_SIZE,
+                    stream_callback=audio_callback_other
                 )
+                stream.start_stream()
                 self.streams = [stream]
 
-                # Start single mic capture thread
+                # Start single mic capture thread (reads from callback queue)
                 capture_thread = threading.Thread(
                     target=self._capture_loop_single,
-                    args=(stream, vad),
+                    args=(self._raw_frame_queue_other, vad),
                     daemon=True
                 )
                 capture_thread.start()
@@ -178,14 +237,32 @@ class ContextService(BaseAudioService):
                 vad_user = webrtcvad.Vad(self.VAD_AGGRESSIVENESS)
                 vad_other = webrtcvad.Vad(self.VAD_AGGRESSIVENESS)
 
-                # Open audio streams
+                # Create callbacks for audio capture (more reliable with Intel mics)
+                def audio_callback_user(in_data, frame_count, time_info, status):
+                    if self.running:
+                        try:
+                            self._raw_frame_queue_user.put_nowait(in_data)
+                        except:
+                            pass  # Queue full, drop frame
+                    return (None, pyaudio.paContinue)
+
+                def audio_callback_other(in_data, frame_count, time_info, status):
+                    if self.running:
+                        try:
+                            self._raw_frame_queue_other.put_nowait(in_data)
+                        except:
+                            pass  # Queue full, drop frame
+                    return (None, pyaudio.paContinue)
+
+                # Open audio streams with callbacks
                 stream_user = self.pyaudio.open(
                     format=pyaudio.paInt16,
                     channels=1,
                     rate=self.SAMPLE_RATE,
                     input=True,
                     input_device_index=mic1_index,
-                    frames_per_buffer=self.FRAME_SIZE
+                    frames_per_buffer=self.FRAME_SIZE,
+                    stream_callback=audio_callback_user
                 )
                 stream_other = self.pyaudio.open(
                     format=pyaudio.paInt16,
@@ -193,14 +270,17 @@ class ContextService(BaseAudioService):
                     rate=self.SAMPLE_RATE,
                     input=True,
                     input_device_index=mic2_index,
-                    frames_per_buffer=self.FRAME_SIZE
+                    frames_per_buffer=self.FRAME_SIZE,
+                    stream_callback=audio_callback_other
                 )
+                stream_user.start_stream()
+                stream_other.start_stream()
                 self.streams = [stream_user, stream_other]
 
-                # Start dual mic capture thread
+                # Start dual mic capture thread (reads from callback queues)
                 capture_thread = threading.Thread(
                     target=self._capture_loop_dual,
-                    args=(stream_user, stream_other, vad_user, vad_other),
+                    args=(vad_user, vad_other),
                     daemon=True
                 )
                 capture_thread.start()
@@ -241,41 +321,92 @@ class ContextService(BaseAudioService):
         """Get current conversation state."""
         return self.current_state.copy()
 
-    def _capture_loop_single(self, stream, vad) -> None:
-        """Single mic audio capture loop."""
+    def set_emotion(self, emotion: str, emotion_display: str) -> None:
+        """Set the current emotion from external source (EmotionService).
+
+        Args:
+            emotion: Raw emotion string (e.g., 'happy', 'sad')
+            emotion_display: Display string (e.g., 'Happy')
+        """
+        with self._emotion_lock:
+            # Only update and write if emotion actually changed
+            if self._external_emotion != emotion:
+                self._external_emotion = emotion
+                self.current_state['emotion'] = emotion
+                self.current_state['emotion_display'] = emotion_display
+                self.current_state['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                # Write state so overlay picks up the change
+                self.write_state(self.current_state)
+
+    def set_speaking_state(self, is_other_speaking: bool, is_user_speaking: bool = False) -> None:
+        """Update speaking state for UI indicators.
+
+        Args:
+            is_other_speaking: Whether the other person is currently speaking
+            is_user_speaking: Whether the user is currently speaking
+        """
+        self.current_state['is_other_speaking'] = is_other_speaking
+        self.current_state['is_user_speaking'] = is_user_speaking
+
+    def _add_social_cue(self, cue: SocialCue) -> None:
+        """Add a social cue to the state if cooldown allows."""
+        now = time.time()
+        if now - self._last_social_cue_time < self.SOCIAL_CUE_COOLDOWN:
+            return
+
+        self._last_social_cue_time = now
+        self.current_state['social_cue'] = cue.message
+        self.current_state['social_cue_icon'] = cue.icon
+        self.current_state['social_cue_timestamp'] = now
+        print(f"[SOCIAL CUE] {cue.icon} {cue.message}")
+
+    def _capture_loop_single(self, raw_frame_queue: Queue, vad) -> None:
+        """Single mic audio capture loop (reads from callback queue)."""
         print("[AUDIO] Single mic capture loop started")
         state = {'frames': [], 'silence': 0, 'speaking': False, 'speech_count': 0}
 
         while self.running:
             try:
-                frame = stream.read(self.FRAME_SIZE, exception_on_overflow=False)
+                # Get frame from callback queue with timeout
+                frame = raw_frame_queue.get(timeout=0.1)
                 self._process_frame(frame, vad, state, self.audio_queue_other, "[MIC]")
+            except Empty:
+                continue  # No frame available, keep waiting
             except Exception as e:
                 if self.running:
                     print(f"[AUDIO] Capture error: {e}")
                 break
 
-    def _capture_loop_dual(self, stream_user, stream_other, vad_user, vad_other) -> None:
-        """Dual mic audio capture loop processing both microphones."""
+    def _capture_loop_dual(self, vad_user, vad_other) -> None:
+        """Dual mic audio capture loop (reads from callback queues)."""
         # State tracking
         state_user = {'frames': [], 'silence': 0, 'speaking': False, 'speech_count': 0}
         state_other = {'frames': [], 'silence': 0, 'speaking': False, 'speech_count': 0}
 
         while self.running:
             try:
-                # Process user mic
-                frame_user = stream_user.read(self.FRAME_SIZE, exception_on_overflow=False)
-                self._process_frame(
-                    frame_user, vad_user, state_user,
-                    self.audio_queue_user, "[USER]"
-                )
+                # Process user mic (non-blocking to allow interleaving)
+                try:
+                    frame_user = self._raw_frame_queue_user.get_nowait()
+                    self._process_frame(
+                        frame_user, vad_user, state_user,
+                        self.audio_queue_user, "[USER]"
+                    )
+                except Empty:
+                    pass
 
-                # Process other mic
-                frame_other = stream_other.read(self.FRAME_SIZE, exception_on_overflow=False)
-                self._process_frame(
-                    frame_other, vad_other, state_other,
-                    self.audio_queue_other, "[OTHER]"
-                )
+                # Process other mic (non-blocking)
+                try:
+                    frame_other = self._raw_frame_queue_other.get_nowait()
+                    self._process_frame(
+                        frame_other, vad_other, state_other,
+                        self.audio_queue_other, "[OTHER]"
+                    )
+                except Empty:
+                    pass
+
+                # Small sleep to prevent busy-waiting
+                time.sleep(0.005)
 
             except Exception as e:
                 if self.running:
@@ -285,6 +416,12 @@ class ContextService(BaseAudioService):
     def _process_frame(self, frame: bytes, vad, state: dict, queue: Queue, label: str) -> None:
         """Process a single audio frame with VAD."""
         is_speech = vad.is_speech(frame, self.SAMPLE_RATE)
+
+        # Update speaking state for UI
+        if label == "[OTHER]" or label == "[MIC]":
+            self.current_state['is_other_speaking'] = is_speech or state['speaking']
+        elif label == "[USER]":
+            self.current_state['is_user_speaking'] = is_speech or state['speaking']
 
         if is_speech:
             if not state['speaking']:
@@ -313,6 +450,12 @@ class ContextService(BaseAudioService):
                 state['speaking'] = False
                 state['speech_count'] = 0
 
+                # Update speaking state when done
+                if label == "[OTHER]" or label == "[MIC]":
+                    self.current_state['is_other_speaking'] = False
+                elif label == "[USER]":
+                    self.current_state['is_user_speaking'] = False
+
     def _transcription_processor(self, audio_queue: Queue, label: str, directory: Path) -> None:
         """Background processor for transcriptions."""
         try:
@@ -331,12 +474,27 @@ class ContextService(BaseAudioService):
                         utterances_batch.append(text)
                         last_utterance_time = time.time()
 
+                        # === IMMEDIATE UPDATE (no waiting for LLM) ===
                         # Update recent utterance in state
                         self.current_state['recent_utterance'] = text
 
                         # Check for questions
                         if '?' in text:
                             self.current_state['question'] = text
+
+                        # Run social cue detection immediately
+                        with self._emotion_lock:
+                            current_emotion = self._external_emotion
+                        cues = detect_social_cues(text, current_emotion)
+                        if cues:
+                            # Add the highest confidence cue
+                            best_cue = max(cues, key=lambda c: c.confidence)
+                            self._add_social_cue(best_cue)
+
+                        # Write state IMMEDIATELY so UI updates fast
+                        self.current_state['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                        self.write_state(self.current_state)
+                        # === END IMMEDIATE UPDATE ===
 
                         word_count = sum(len(u.split()) for u in utterances_batch)
 
@@ -509,55 +667,107 @@ class ContextService(BaseAudioService):
         if not user_contexts and not other_contexts:
             return
 
+        # Get current emotion for context
+        with self._emotion_lock:
+            current_emotion = self._external_emotion or "unknown"
+
         # Build prompt based on mode
         if self.single_mic_mode:
             # Single mic mode - just summarize the conversation
             context_text = "Recent conversation:\n"
             for ctx in sorted(other_contexts, key=lambda x: x['data']['timestamp']):
-                context_text += f"- [{ctx['data']['timestamp']}] {ctx['data']['text']}\n"
+                context_text += f"- {ctx['data']['text']}\n"
 
-            prompt = f"""Based on the following conversation snippets, provide a concise summary of what is being discussed.
-
+            prompt = f"""Conversation context:
 {context_text}
 
-Provide a brief summary (2-3 sentences max) of the conversation topic and key points."""
+The speaker's current facial expression: {current_emotion}
+
+Respond with ONLY a JSON object (no markdown):
+{{"summary": "<max 80 chars: what they're discussing>", "vibe": "<one word: engaged/bored/upset/excited/neutral>"}}"""
         else:
             # Dual mic mode - summarize both speakers
             user_text = ""
             if user_contexts:
-                user_text = "USER's recent statements:\n"
+                user_text = "USER said:\n"
                 for ctx in sorted(user_contexts, key=lambda x: x['data']['timestamp']):
-                    user_text += f"- [{ctx['data']['timestamp']}] {ctx['data']['text']}\n"
+                    user_text += f"- {ctx['data']['text']}\n"
 
             other_text = ""
             if other_contexts:
-                other_text = "\nOTHER PERSON's recent statements:\n"
+                other_text = "\nOTHER PERSON said:\n"
                 for ctx in sorted(other_contexts, key=lambda x: x['data']['timestamp']):
-                    other_text += f"- [{ctx['data']['timestamp']}] {ctx['data']['text']}\n"
+                    other_text += f"- {ctx['data']['text']}\n"
 
-            prompt = f"""Based on the following conversation snippets, provide a concise summary of the current conversation state - what they're discussing and the key points so far.
-
+            prompt = f"""Conversation context:
 {user_text}{other_text}
 
-Provide a brief summary (2-3 sentences max) of what the conversation is about and its current state."""
+The other person's current facial expression: {current_emotion}
+
+Respond with ONLY a JSON object (no markdown):
+{{"summary": "<max 80 chars: what they're discussing>", "vibe": "<one word: engaged/bored/upset/excited/neutral>"}}"""
+
+        # Neurodivergent-focused system prompt
+        system_prompt = """You are a real-time conversation assistant for neurodivergent users.
+
+Your role: Summarize conversations in an extremely concise way that fits on an AR overlay.
+
+CRITICAL RULES:
+1. Summary MUST be under 80 characters - this is a hard limit
+2. Focus on WHAT they're discussing, not transcription
+3. Vibe should reflect the other person's engagement level
+4. Respond with valid JSON only, no markdown code blocks
+
+Examples of good summaries:
+- "Discussing weekend hiking plans, they seem excited"
+- "Talking about work deadlines, slight tension"
+- "Catching up on family news, relaxed chat"
+
+Examples of BAD summaries (too long):
+- "The conversation is about their plans for the upcoming weekend where they want to go hiking" (TOO LONG!)"""
 
         try:
             print(f"[GPT] Sending to GPT-4o-mini for summary...")
             response = self.client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "You are a conversation analyst. Summarize conversation states concisely."},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.7,
-                max_tokens=150
+                temperature=0.5,
+                max_tokens=60  # Reduced from 150 for conciseness
             )
 
-            summary = response.choices[0].message.content.strip()
-            print(f"[GPT] Got summary: \"{summary}\"")
+            response_text = response.choices[0].message.content.strip()
+            print(f"[GPT] Got response: \"{response_text}\"")
+
+            # Parse JSON response
+            try:
+                # Remove markdown code blocks if present
+                if response_text.startswith("```"):
+                    response_text = response_text.split("```")[1]
+                    if response_text.startswith("json"):
+                        response_text = response_text[4:]
+                    response_text = response_text.strip()
+
+                import json as json_module
+                result = json_module.loads(response_text)
+                summary = result.get('summary', response_text)
+                vibe = result.get('vibe', 'neutral')
+            except:
+                # Fallback: use raw response
+                summary = response_text
+                vibe = 'neutral'
+
+            # Enforce character limit
+            if len(summary) > 80:
+                summary = summary[:77] + "..."
+
+            print(f"[GPT] Parsed summary: \"{summary}\" (vibe: {vibe})")
 
             # Update current state
             self.current_state['convo_state_summary'] = summary
+            self.current_state['vibe'] = vibe
             self.current_state['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
 
             # Write to file for overlay

@@ -8,11 +8,14 @@ from .base import BaseAudioService
 from .audio_manager import AudioManager
 from .context_service import ContextService
 from .voice_isolation_service import VoiceIsolationService
+from .emotion_service import EmotionService
+from .social_cue_detector import SocialCueDetector, detect_social_cues, CueType, SocialCue
 
 # Registry of available audio services
 AUDIO_SERVICES = {
     "context": ContextService,
     "voice_isolation": VoiceIsolationService,
+    "emotion": EmotionService,
 }
 
 __all__ = [
@@ -20,5 +23,10 @@ __all__ = [
     'AudioManager',
     'ContextService',
     'VoiceIsolationService',
+    'EmotionService',
+    'SocialCueDetector',
+    'detect_social_cues',
+    'CueType',
+    'SocialCue',
     'AUDIO_SERVICES',
 ]

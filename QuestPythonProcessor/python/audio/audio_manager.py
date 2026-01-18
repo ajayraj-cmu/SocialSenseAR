@@ -2,9 +2,11 @@
 Audio Manager - Orchestrates all audio services.
 
 Manages starting/stopping audio services alongside the video pipeline.
+Provides integration between emotion detection and context services.
 """
 from pathlib import Path
 from typing import Dict, List, Optional
+import numpy as np
 
 from .base import BaseAudioService
 
@@ -27,8 +29,8 @@ class AudioManager:
         state_dir = getattr(config, 'audio_state_dir', '~/Downloads/Nex/conve_context')
         self.state_dir = Path(state_dir).expanduser()
 
-        # Initialize requested services
-        requested = services or getattr(config, 'audio_services', ['context'])
+        # Initialize requested services (include emotion by default for conversation helper)
+        requested = services or getattr(config, 'audio_services', ['context', 'emotion'])
         self._init_services(requested)
 
     def _init_services(self, service_names: List[str]) -> None:
@@ -94,6 +96,55 @@ class AudioManager:
         """
         if service_name in self.services:
             return self.services[service_name].get_state()
+        return {}
+
+    def submit_face(self, face_image: np.ndarray, bbox=None) -> None:
+        """Submit a face image to the emotion service for detection.
+
+        Call this from the video pipeline with the cropped face of the
+        person being tracked.
+
+        Args:
+            face_image: BGR face image (cropped from frame)
+            bbox: Optional bounding box (x, y, w, h) for context
+        """
+        if 'emotion' in self.services:
+            self.services['emotion'].submit_face(face_image, bbox)
+
+        # Sync emotion to context service (emotion detection runs async)
+        self._sync_emotion_to_context()
+
+    def _sync_emotion_to_context(self) -> None:
+        """Sync current emotion state from emotion service to context service."""
+        if 'emotion' in self.services and 'context' in self.services:
+            emotion_state = self.services['emotion'].get_state()
+            if emotion_state:
+                emotion = emotion_state.get('emotion', 'neutral')
+                emotion_display = emotion_state.get('emotion_display', 'Neutral')
+                self.services['context'].set_emotion(emotion, emotion_display)
+
+    def get_speaking_state(self) -> dict:
+        """Get current speaking state from context service.
+
+        Returns:
+            Dict with 'is_other_speaking' and 'is_user_speaking' booleans
+        """
+        if 'context' in self.services:
+            state = self.services['context'].get_state()
+            return {
+                'is_other_speaking': state.get('is_other_speaking', False),
+                'is_user_speaking': state.get('is_user_speaking', False)
+            }
+        return {'is_other_speaking': False, 'is_user_speaking': False}
+
+    def get_emotion(self) -> dict:
+        """Get current emotion from emotion service.
+
+        Returns:
+            Dict with emotion info or empty dict
+        """
+        if 'emotion' in self.services:
+            return self.services['emotion'].get_state()
         return {}
 
     def list_microphones(self) -> None:

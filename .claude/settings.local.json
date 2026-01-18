@@ -1,7 +1,32 @@
 {
   "permissions": {
     "allow": [
-      "Bash(taskkill:*)"
+      "Bash(taskkill:*)",
+      "Bash(git checkout:*)",
+      "Bash(python:*)",
+      "Bash(scrcpy:*)",
+      "Bash(adb devices:*)",
+      "Bash(where scrcpy)",
+      "Bash(winget show:*)",
+      "Bash(cmd.exe /c \"winget show Genymobile.scrcpy\":*)",
+      "Bash(powershell.exe -Command \"winget search scrcpy\")",
+      "Bash(cmd.exe /c \"dir /s /b C:\\\\scrcpy*.exe 2>nul\")",
+      "Bash(cmd.exe /c \"dir /s /b C:\\\\Users\\\\Marshall\\\\*scrcpy*.exe 2>nul\")",
+      "Bash(powershell.exe:*)",
+      "Bash(for path in \"/c/scrcpy/scrcpy.exe\" \"/c/tools/scrcpy/scrcpy.exe\" \"/c/Program Files/scrcpy/scrcpy.exe\" \"/c/Users/Marshall/scrcpy/scrcpy.exe\" \"/c/Users/Marshall/Downloads/scrcpy\"*/scrcpy.exe \"/c/Users/Marshall/AppData/Local/Android/Sdk/platform-tools/scrcpy.exe\")",
+      "Bash(do)",
+      "Bash(if [[ -f \"$path\" ]])",
+      "Bash(then)",
+      "Bash(echo:*)",
+      "Bash(fi)",
+      "Bash(done)",
+      "Bash(ls:*)",
+      "Bash(curl:*)",
+      "Bash(/c/scrcpy/scrcpy-win64-v3.3.4/scrcpy.exe --version)",
+      "WebSearch"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\Marshall\\Documents\\GitHub\\nexhacks\\QuestCameraKit"
     ]
   }
 }
